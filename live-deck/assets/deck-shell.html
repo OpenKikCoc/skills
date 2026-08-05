@@ -1,0 +1,1733 @@
+<!DOCTYPE html>
+<html lang="en" data-deck="orderflow-example">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OrderFlow Pipeline · Team Walkthrough</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+
+  :root {
+    --surround: #0b1220;
+    --surround-2: #131c2c;
+    --rail-h: 52px;
+
+    --chrome-ink: #e8eef7;
+    --chrome-muted: #8b9bb4;
+    --chrome-line: rgba(232, 238, 247, 0.14);
+    --chrome-hover: rgba(232, 238, 247, 0.09);
+
+    /* Arc colours encode the deck's narrative sections. Rename / add arcs to
+       match your own deck's argument; each slide is tagged with one. */
+    --arc-frame: #94a3b8;
+    --arc-intake: #1677c8;
+    --arc-dispatch: #5b5bd6;
+    --arc-converge: #249c62;
+
+    --ui: "Segoe UI", Arial, sans-serif;
+
+    --seg-track: rgba(232, 238, 247, 0.16);
+    --seg-hover: rgba(232, 238, 247, 0.42);
+    --card-bg: rgba(232, 238, 247, 0.03);
+    --card-line-on: rgba(232, 238, 247, 0.55);
+    --overlay-bg: rgba(6, 11, 20, 0.985);
+    --stage-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+    --prose: #cbd6e6;
+  }
+
+  /* The dark surround is the deck's own identity, so it is the default.
+     A viewer on a light theme gets a paper-grey surround instead of an
+     inverted one — the slides themselves are light either way. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --surround: #e6ebf3;
+      --chrome-ink: #16233a;
+      --chrome-muted: #5b6b85;
+      --chrome-line: rgba(22, 35, 58, 0.16);
+      --chrome-hover: rgba(22, 35, 58, 0.06);
+      --seg-track: rgba(22, 35, 58, 0.16);
+      --seg-hover: rgba(22, 35, 58, 0.42);
+      --card-bg: rgba(255, 255, 255, 0.7);
+      --card-line-on: rgba(22, 35, 58, 0.45);
+      --overlay-bg: rgba(232, 237, 244, 0.985);
+      --stage-shadow: 0 18px 50px rgba(22, 35, 58, 0.18);
+      --prose: #2c3a52;
+    }
+  }
+
+  :root[data-theme="light"] {
+    --surround: #e6ebf3;
+    --chrome-ink: #16233a;
+    --chrome-muted: #5b6b85;
+    --chrome-line: rgba(22, 35, 58, 0.16);
+    --chrome-hover: rgba(22, 35, 58, 0.06);
+    --seg-track: rgba(22, 35, 58, 0.16);
+    --seg-hover: rgba(22, 35, 58, 0.42);
+    --card-bg: rgba(255, 255, 255, 0.7);
+    --card-line-on: rgba(22, 35, 58, 0.45);
+    --overlay-bg: rgba(232, 237, 244, 0.985);
+    --stage-shadow: 0 18px 50px rgba(22, 35, 58, 0.18);
+    --prose: #2c3a52;
+  }
+
+  :root[data-theme="dark"] {
+    --surround: #0b1220;
+    --chrome-ink: #e8eef7;
+    --chrome-muted: #8b9bb4;
+    --chrome-line: rgba(232, 238, 247, 0.14);
+    --chrome-hover: rgba(232, 238, 247, 0.09);
+    --seg-track: rgba(232, 238, 247, 0.16);
+    --seg-hover: rgba(232, 238, 247, 0.42);
+    --card-bg: rgba(232, 238, 247, 0.03);
+    --card-line-on: rgba(232, 238, 247, 0.55);
+    --overlay-bg: rgba(6, 11, 20, 0.985);
+    --stage-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+    --prose: #cbd6e6;
+  }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--surround);
+    color: var(--chrome-ink);
+    font-family: var(--ui);
+    overflow: hidden;
+  }
+
+  button { font: inherit; color: inherit; }
+
+  /* ---------- layout ---------- */
+
+  .deck {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  .stagewrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    padding: 0;
+  }
+
+  /* Sized in JS to an exact 16:9 box so each slide's own 1600x900 stage
+     lands at the same proportions it had in the original deck. */
+  .stage {
+    position: relative;
+    background: #ffffff;
+    overflow: hidden;
+    box-shadow: var(--stage-shadow);
+  }
+
+  body.is-presenting .stage { box-shadow: none; }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+    background: #ffffff;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 240ms ease;
+  }
+
+  .slide.is-current {
+    opacity: 1;
+    z-index: 2;
+  }
+
+  /* Zoom layer. Zooming resizes this box rather than CSS-scaling it, so each
+     slide re-runs its own fitStage() and the text is re-rendered crisp at the
+     new size instead of being magnified as pixels. */
+  .stage-zoom {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .stage.is-zoomed { cursor: grab; }
+  .stage.is-panning { cursor: grabbing; }
+
+  /* Presenter pointer. Sits above everything and never intercepts input. */
+  .fx-canvas {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    pointer-events: none;
+  }
+
+  .explore-button {
+    position: absolute;
+    top: 76px;
+    right: 18px;
+    z-index: 4;
+    height: 34px;
+    padding: 0 14px;
+    border: 1px solid rgba(22, 119, 200, 0.34);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.96);
+    color: #0c5f9e;
+    box-shadow: 0 7px 22px rgba(15, 23, 42, 0.09);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+  }
+
+  .explore-button:hover {
+    background: #ffffff;
+    border-color: rgba(22, 119, 200, 0.58);
+    transform: translateY(-1px);
+  }
+
+  .explore-button:focus-visible {
+    outline: 2px solid #0c5f9e;
+    outline-offset: 3px;
+  }
+
+  /* ---------- rail ---------- */
+
+  .rail {
+    flex: 0 0 auto;
+    height: var(--rail-h);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 0 18px;
+    border-top: 1px solid var(--chrome-line);
+    background: var(--surround);
+  }
+
+  body.is-presenting .rail { display: none; }
+
+  .rail-id {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+
+  .rail-deck {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--chrome-muted);
+    white-space: nowrap;
+  }
+
+  .rail-eyebrow {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--chrome-ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Segmented by arc: gaps inside an arc are tight, gaps between arcs are wide. */
+  .rail-track {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    min-width: 80px;
+  }
+
+  .seg {
+    flex: 1 1 0;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--seg-track);
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    transition: height 160ms ease, background-color 160ms ease, opacity 160ms ease;
+  }
+
+  .seg[data-arc-start="true"] { margin-left: 13px; }
+  .seg:first-child { margin-left: 0; }
+
+  .seg:hover { background: var(--seg-hover); height: 7px; }
+
+  .seg.is-seen { background: var(--seg-color); opacity: 0.42; }
+
+  .seg.is-current {
+    height: 9px;
+    background: var(--seg-color);
+    opacity: 1;
+  }
+
+  .seg:focus-visible {
+    outline: 2px solid var(--chrome-ink);
+    outline-offset: 3px;
+  }
+
+  .rail-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+
+  .counter {
+    font-size: 12px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--chrome-muted);
+    letter-spacing: 0.04em;
+    padding-right: 4px;
+    white-space: nowrap;
+  }
+
+  .counter b { color: var(--chrome-ink); font-weight: 700; }
+
+  .btn {
+    height: 30px;
+    min-width: 30px;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid var(--chrome-line);
+    background: transparent;
+    color: var(--chrome-muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn:hover:not(:disabled) { background: var(--chrome-hover); color: var(--chrome-ink); }
+  .btn:disabled { opacity: 0.3; cursor: default; }
+  .btn:focus-visible { outline: 2px solid var(--chrome-ink); outline-offset: 2px; }
+  .btn.is-on { color: var(--chrome-ink); border-color: var(--seg-hover); }
+  .btn svg { width: 13px; height: 13px; fill: currentColor; }
+
+  /* ---------- overlays ---------- */
+
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: var(--overlay-bg);
+    backdrop-filter: blur(8px);
+    display: none;
+    flex-direction: column;
+  }
+
+  .overlay.is-open { display: flex; }
+
+  .overlay-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 26px 32px 18px;
+    border-bottom: 1px solid var(--chrome-line);
+  }
+
+  .overlay-head h2 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .overlay-head p {
+    margin: 0;
+    font-size: 12px;
+    color: var(--chrome-muted);
+  }
+
+  .overlay-close { margin-left: auto; }
+
+  .overlay-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 26px 32px 40px;
+  }
+
+  .explore-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 12px;
+  }
+
+  .explore-viewport {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .explore-viewport.is-zoomed { cursor: grab; }
+  .explore-viewport.is-panning { cursor: grabbing; }
+
+  .explore-zoom {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .explore-frame {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #ffffff;
+  }
+
+  .zoom-ctl {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 2px;
+    padding-right: 8px;
+    border-right: 1px solid var(--chrome-line);
+  }
+
+  .zoom-level {
+    min-width: 46px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--chrome-muted);
+    letter-spacing: 0.02em;
+  }
+
+  /* overview grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+  }
+
+  .card {
+    position: relative;
+    text-align: left;
+    padding: 14px 16px 16px;
+    border: 1px solid var(--chrome-line);
+    border-radius: 12px;
+    background: var(--card-bg);
+    color: inherit;
+    cursor: pointer;
+    overflow: hidden;
+    transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+  }
+
+  .card::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--seg-color);
+  }
+
+  .card:hover { background: var(--chrome-hover); transform: translateY(-2px); }
+  .card:focus-visible { outline: 2px solid var(--chrome-ink); outline-offset: 2px; }
+  .card.is-current { border-color: var(--card-line-on); background: var(--chrome-hover); }
+
+  .card-n {
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--chrome-muted);
+  }
+
+  .card-eyebrow {
+    margin-top: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--seg-color);
+  }
+
+  .card-title {
+    margin-top: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.35;
+  }
+
+  /* notes */
+  .notes-wrap { max-width: 860px; }
+
+  .notes-eyebrow {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--seg-color, var(--chrome-muted));
+  }
+
+  .notes-title {
+    margin: 8px 0 20px;
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1.25;
+  }
+
+  .notes-body {
+    margin: 0;
+    font-family: var(--ui);
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--prose);
+    white-space: pre-wrap;
+  }
+
+  /* help */
+  .keys { display: grid; gap: 10px; max-width: 560px; }
+
+  .keyrow {
+    display: grid;
+    grid-template-columns: 168px 1fr;
+    gap: 16px;
+    align-items: baseline;
+    font-size: 13px;
+    color: var(--prose);
+  }
+
+  kbd {
+    display: inline-block;
+    min-width: 22px;
+    padding: 2px 7px;
+    border: 1px solid var(--chrome-line);
+    border-bottom-width: 2px;
+    border-radius: 6px;
+    background: var(--card-bg);
+    font-family: var(--ui);
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+    color: var(--chrome-ink);
+  }
+
+  .noscript-note {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 40px;
+    text-align: center;
+    font-size: 15px;
+    line-height: 1.6;
+    z-index: 90;
+    background: var(--surround);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<canvas class="fx-canvas" id="fx-canvas" aria-hidden="true"></canvas>
+
+<div class="deck">
+  <div class="stagewrap" id="stagewrap">
+    <div class="stage" id="stage">
+      <div class="stage-zoom" id="stage-zoom">
+        <!-- The bundler contract: exactly ONE <iframe class="slide"> per entry
+             in the SLIDES list below, in the same order. build-single-file.py
+             fills each tag's data-doc with that slide's whole document. -->
+        <iframe class="slide" title="One order becomes one shipment"></iframe>
+        <iframe class="slide" title="Blank slide template"></iframe>
+      </div>
+      <button class="explore-button" id="btn-explore" type="button"
+              aria-haspopup="dialog" aria-controls="ov-explore">Explore Slide</button>
+    </div>
+  </div>
+
+  <footer class="rail" id="rail">
+    <div class="rail-id">
+      <span class="rail-deck">OrderFlow Pipeline</span>
+      <span class="rail-eyebrow" id="rail-eyebrow"></span>
+    </div>
+
+    <div class="rail-track" id="rail-track" role="tablist" aria-label="Slides"></div>
+
+    <div class="rail-actions">
+      <div class="zoom-ctl">
+        <button class="btn" id="btn-zoom-out" type="button" title="Zoom out (-)" aria-label="Zoom out">&minus;</button>
+        <span class="zoom-level" id="zoom-level">100%</span>
+        <button class="btn" id="btn-zoom-in" type="button" title="Zoom in (+)" aria-label="Zoom in">+</button>
+        <button class="btn" id="btn-zoom-reset" type="button" title="Reset zoom (0)">Fit</button>
+      </div>
+      <span class="counter" id="counter"><b>1</b> / 2</span>
+      <button class="btn" id="btn-prev" type="button" title="Previous (Left arrow)" aria-label="Previous">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5 5 8l5.5 5.5 1.1-1.1L7.2 8l4.4-4.4z"/></svg>
+      </button>
+      <button class="btn" id="btn-next" type="button" title="Next (Right arrow)" aria-label="Next">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 2.5 11 8l-5.5 5.5-1.1-1.1L8.8 8 4.4 3.6z"/></svg>
+      </button>
+      <button class="btn" id="btn-overview" type="button" title="All slides (O)">All slides</button>
+      <button class="btn" id="btn-notes" type="button" title="Speaker notes (N)">Notes</button>
+      <button class="btn" id="btn-present" type="button" title="Present full screen (F)">Present</button>
+      <button class="btn" id="btn-pointer" type="button" title="Presenter pointer (L)">Pointer</button>
+      <button class="btn" id="btn-help" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+    </div>
+  </footer>
+</div>
+
+<div class="overlay" id="ov-overview" role="dialog" aria-modal="true" aria-label="All slides">
+  <div class="overlay-head">
+    <h2>All slides</h2>
+    <p>Click a slide to jump to it</p>
+    <button class="btn overlay-close" type="button" data-close>Close</button>
+  </div>
+  <div class="overlay-body"><div class="grid" id="overview-grid"></div></div>
+</div>
+
+<div class="overlay" id="ov-notes" role="dialog" aria-modal="true" aria-label="Speaker notes">
+  <div class="overlay-head">
+    <h2>Speaker notes</h2>
+    <p>Presenter narration for the current slide</p>
+    <button class="btn overlay-close" type="button" data-close>Close</button>
+  </div>
+  <div class="overlay-body">
+    <div class="notes-wrap">
+      <div class="notes-eyebrow" id="notes-eyebrow"></div>
+      <div class="notes-title" id="notes-title"></div>
+      <pre class="notes-body" id="notes-body"></pre>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+  <div class="overlay-head">
+    <h2>Keyboard</h2>
+    <p>Deck navigation changes slides; Explore Slide reveals each diagram's step-through build</p>
+    <button class="btn overlay-close" type="button" data-close>Close</button>
+  </div>
+  <div class="overlay-body">
+    <div class="keys">
+      <div class="keyrow"><span><kbd>&rarr;</kbd> <kbd>Space</kbd> <kbd>PgDn</kbd></span><span>Next slide</span></div>
+      <div class="keyrow"><span><kbd>&larr;</kbd> <kbd>PgUp</kbd></span><span>Previous slide</span></div>
+      <div class="keyrow"><span><kbd>&darr;</kbd> / <kbd>&uarr;</kbd></span><span>Next / previous slide</span></div>
+      <div class="keyrow"><span><kbd>Home</kbd> / <kbd>End</kbd></span><span>First / last slide</span></div>
+      <div class="keyrow"><span><kbd>1</kbd>&ndash;<kbd>9</kbd></span><span>Jump to that slide</span></div>
+      <div class="keyrow"><span>Wheel / <kbd>+</kbd> <kbd>&minus;</kbd></span><span>Zoom the diagram in and out</span></div>
+      <div class="keyrow"><span>Drag / double-click</span><span>Pan while zoomed / toggle 250%</span></div>
+      <div class="keyrow"><span><kbd>0</kbd></span><span>Reset zoom to fit</span></div>
+      <div class="keyrow"><span><kbd>L</kbd></span><span>Presenter pointer on / off</span></div>
+      <div class="keyrow"><span><kbd>O</kbd></span><span>All slides</span></div>
+      <div class="keyrow"><span><kbd>N</kbd></span><span>Speaker notes</span></div>
+      <div class="keyrow"><span><kbd>F</kbd></span><span>Present full screen</span></div>
+      <div class="keyrow"><span><kbd>Esc</kbd></span><span>Close Explore or another overlay</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-explore" role="dialog" aria-modal="true" aria-labelledby="explore-title">
+  <div class="overlay-head">
+    <h2 id="explore-title">Explore Slide</h2>
+    <p id="explore-subtitle"></p>
+    <div class="zoom-ctl">
+      <button class="btn" id="btn-ex-zoom-out" type="button" aria-label="Zoom out">&minus;</button>
+      <span class="zoom-level" id="ex-zoom-level">100%</span>
+      <button class="btn" id="btn-ex-zoom-in" type="button" aria-label="Zoom in">+</button>
+      <button class="btn" id="btn-ex-zoom-reset" type="button">Fit</button>
+    </div>
+    <button class="btn overlay-close" type="button" data-close-explore>Close</button>
+  </div>
+  <div class="explore-body">
+    <div class="explore-viewport" id="explore-viewport">
+      <div class="explore-zoom" id="explore-zoom">
+  <iframe class="explore-frame" id="explore-frame" name="deck-explore"
+            title="Interactive slide detail"></iframe>
+      </div>
+    </div>
+  </div>
+</div>
+
+<noscript>
+  <div class="noscript-note">This deck needs JavaScript to page between slides.<br>Each slide is also a standalone HTML file you can open directly.</div>
+</noscript>
+
+<script>
+(function () {
+  'use strict';
+
+  /* Presentation order lives in this list, not in file names. Each entry:
+       file    -- the slide's HTML file (a sibling of this shell)
+       arc     -- narrative section; must be a key of ARC_COLOR below
+       eyebrow -- short section label shown in the rail and overview cards
+       title   -- slide title shown in the overview and speaker notes
+       notes   -- presenter narration (plain text; \n for line breaks)
+     Keep this list and the <iframe class="slide"> tags above in the same
+     order, one iframe per entry -- build-single-file.py checks the match. */
+  var SLIDES = [
+    {
+      file: 'example-slide.html',
+      arc: 'intake',
+      eyebrow: '01 \u00B7 Intake',
+      title: 'One order becomes one shipment',
+      notes: 'Target time: 2 min\n\nOpening: Follow a single order through the whole pipeline before zooming into any component.\n\nTeaching points:\n- The storefront API only records the order; it never talks to carriers.\n- The intake queue absorbs bursts, so workers pull at their own pace.\n- The validator is the only writer to the orders database.\n- The dispatch planner turns each validated order into exactly one shipment record.\n\nTransition: The next slide is the blank template -- replace it with your second slide.'
+    },
+    {
+      file: 'slide-template.html',
+      arc: 'frame',
+      eyebrow: '02 \u00B7 Template',
+      title: 'Blank slide template',
+      notes: 'This entry exists so a fresh copy of the deck pages and builds out of the box.\n\nTo add a real slide: copy slide-template.html to a new file, edit it, then update this entry (file, arc, eyebrow, title, notes) and the matching slide iframe tag above.'
+    }
+  ];
+
+  var ARC_COLOR = {
+    frame: 'var(--arc-frame)',
+    intake: 'var(--arc-intake)',
+    dispatch: 'var(--arc-dispatch)',
+    converge: 'var(--arc-converge)'
+  };
+
+  var LOAD_AHEAD = 1;          // preload this many slides on each side
+  var TOTAL = SLIDES.length;
+
+  var stage = document.getElementById('stage');
+  var stagewrap = document.getElementById('stagewrap');
+  var track = document.getElementById('rail-track');
+  var counter = document.getElementById('counter');
+  var railEyebrow = document.getElementById('rail-eyebrow');
+  var btnPrev = document.getElementById('btn-prev');
+  var btnNext = document.getElementById('btn-next');
+  var btnExplore = document.getElementById('btn-explore');
+  var overviewGrid = document.getElementById('overview-grid');
+  var exploreOverlay = document.getElementById('ov-explore');
+  var exploreFrame = document.getElementById('explore-frame');
+
+  var frames = [];   // iframe elements
+  var segs = [];     // rail segment buttons
+  var cards = [];    // overview cards
+  var state = [];    // per-slide build state reported by the bridge
+  var current = 0;
+  var seen = 0;      // furthest slide reached
+  var exploreReturnFocus = null;
+  var exPending = null;
+
+  for (var i = 0; i < TOTAL; i++) {
+    state.push({ hasSteps: false, step: 0, total: 0, atStart: true, atEnd: true, ready: false });
+  }
+
+  /* ---------- build DOM ---------- */
+
+  /* Two builds share this shell:
+       - multi-file: iframes are created here and load slide-*.html by URL
+       - single-file: the bundler has already written <iframe data-doc="...">
+         elements holding each slide's whole document, so we adopt those. */
+  var prebuilt = Array.prototype.slice.call(stage.querySelectorAll('iframe.slide'));
+
+  SLIDES.forEach(function (s, idx) {
+    var f = prebuilt[idx];
+    if (!f) {
+      f = document.createElement('iframe');
+      f.className = 'slide';
+      f.setAttribute('loading', 'eager');
+      document.getElementById('stage-zoom').appendChild(f);
+    }
+    f.title = s.title;
+    frames.push(f);
+
+    var prevArc = idx > 0 ? SLIDES[idx - 1].arc : null;
+    var seg = document.createElement('button');
+    seg.type = 'button';
+    seg.className = 'seg';
+    seg.style.setProperty('--seg-color', ARC_COLOR[s.arc]);
+    seg.dataset.arcStart = String(idx > 0 && s.arc !== prevArc);
+    seg.title = (idx + 1) + ' · ' + s.title;
+    seg.setAttribute('aria-label', 'Slide ' + (idx + 1) + ': ' + s.title);
+    seg.addEventListener('click', function () { go(idx); });
+    track.appendChild(seg);
+    segs.push(seg);
+
+    var card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'card';
+    card.style.setProperty('--seg-color', ARC_COLOR[s.arc]);
+    card.innerHTML =
+      '<div class="card-n">' + String(idx + 1).padStart(2, '0') + '</div>' +
+      '<div class="card-eyebrow"></div>' +
+      '<div class="card-title"></div>';
+    card.querySelector('.card-eyebrow').textContent = s.eyebrow;
+    card.querySelector('.card-title').textContent = s.title;
+    card.addEventListener('click', function () { closeOverlays(); go(idx); });
+    overviewGrid.appendChild(card);
+    cards.push(card);
+  });
+
+  var slideDocs = frames.map(function (frame) {
+    return frame.dataset.doc != null ? frame.dataset.doc : null;
+  });
+
+  /* ---------- sizing: an exact 16:9 box, letterboxed ---------- */
+
+  function fitStage() {
+    var w = stagewrap.clientWidth;
+    var h = stagewrap.clientHeight;
+    if (!w || !h) return;
+    var width = Math.min(w, h * 16 / 9);
+    var height = width * 9 / 16;
+    stage.style.width = Math.floor(width) + 'px';
+    stage.style.height = Math.floor(height) + 'px';
+    stageZoomer.apply();
+  }
+
+  /* ---------- presenter pointer ----------
+     The cursor is a live firework: a tight, high-frequency ember scatter
+     rides the pointer (plus a comet trail while it moves) and a click
+     throws a large-radius burst, so a remote audience can always find
+     what is being pointed at on a shared screen. Every spark is two-tone
+     (deep-violet rim under a bright core) so it reads on white slides and
+     dark chrome alike. When the pointer rests the spray settles to a
+     faint ember, then fades out entirely and the rAF loop stops.
+     prefers-reduced-motion gets a still sparkle marker instead.
+     Drawn on one full-window canvas that never takes pointer input. */
+
+  var fx = (function () {
+    var canvas = document.getElementById('fx-canvas');
+    var ctx = canvas.getContext('2d');
+    var reduce = window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    var P = {
+      rate: 140,        // sparks/s at the cursor while it moves
+      simmerRate: 14,   // sparks/s once settled, before the ember fades
+      activeMs: 150,    // full-rate window after the last move
+      settleMs: 900,    // ramp from full rate down to simmer
+      holdMs: 3800,     // settled ember lifetime before fading
+      fadeMs: 900,      // ember fade-out
+      ambSpeed: 95,     // px/s   ambient spark launch speed (max)
+      ambLife: 0.62,    // s      ambient spark lifetime (max)
+      ambSize: 1.7,     // px     ambient spark radius (max)
+      trailPer: 7,      // px of travel per trail spark
+      burstN: 48,       // sparks per click (trimmed with the radius, so
+                        //   halving the reach does not quadruple density)
+      burstSpeed: 410,  // px/s   burst launch speed (max). Reach is linear in
+                        //   this: d = v/drag * (1 - e^-(drag*life)) ~= 0.28*v,
+                        //   so 820 -> 410 halves the burst diameter.
+      burstLife: 1.05,  // s      burst spark lifetime (max)
+      burstSize: 2.2,   // px     burst spark radius (max)
+      gravity: 90,      // px/s^2
+      drag: 3.5,        // /s     exponential velocity damping
+      maxParts: 300
+    };
+    if (window.FX_PARAMS) {
+      for (var k in P) if (!(k in window.FX_PARAMS)) window.FX_PARAMS[k] = P[k];
+      P = window.FX_PARAMS;
+    }
+
+    var W = 0, H = 0;
+    var on = true, hasPos = false;
+    var px = 0, py = 0, lastMove = -1e9, lastBurst = -1e9;
+    var parts = [], raf = null, lastT = 0, emitAcc = 0;
+
+    function resize() {
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      W = window.innerWidth;
+      H = window.innerHeight;
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (reduce) drawStill(false);
+    }
+
+    function start() {
+      if (raf === null && !reduce) {
+        lastT = performance.now();
+        raf = requestAnimationFrame(frame);
+      }
+    }
+
+    function spawn(x, y, speed, life, size, vx0, vy0, shell) {
+      if (parts.length >= P.maxParts) parts.shift();
+      var a = Math.random() * 6.2832;
+      /* ambient: random*random biases speeds low (dense core, few fliers);
+         burst "shell": sqrt bias throws most sparks outward fast, so the
+         centre clears quickly and never sits as a blob over the content */
+      var sp = speed * (shell
+        ? 0.3 + 0.7 * Math.sqrt(Math.random())
+        : 0.22 + 0.78 * Math.random() * Math.random());
+      parts.push({
+        x: x, y: y,
+        vx: Math.cos(a) * sp + (vx0 || 0),
+        vy: Math.sin(a) * sp + (vy0 || 0),
+        life: 0,
+        ttl: life * (0.4 + 0.6 * Math.random()),
+        /* squared random: mostly small sparks, occasional large embers */
+        r: size * (0.35 + 0.65 * Math.random() * Math.random()),
+        sk: 0.03 + Math.random() * 0.05,   /* per-spark streak length */
+        h: 242 + Math.random() * 26
+      });
+    }
+
+    function drawEmber(x, y, k, t) {
+      var s = reduce ? 1 : 1 + 0.1 * Math.sin(t * 0.006);
+      var g = ctx.createRadialGradient(x, y, 0, x, y, 12 * s);
+      g.addColorStop(0, 'rgba(112,96,236,' + (0.38 * k) + ')');
+      g.addColorStop(1, 'rgba(112,96,236,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, 12 * s, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(36,28,102,' + (0.8 * k) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 3.0 * s, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(139,126,255,' + k + ')';
+      ctx.beginPath(); ctx.arc(x, y, 2.0 * s, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(244,242,255,' + (0.95 * k) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 1.1 * s, 0, 6.2832); ctx.fill();
+    }
+
+    /* reduced-motion: one still frame — a frozen sparkle (irregular radial
+       rays, deliberately NOT a ring of dots) around the ember */
+    function drawStill(big) {
+      ctx.clearRect(0, 0, W, H);
+      if (!on || !hasPos) return;
+      var n = big ? 9 : 6, R = big ? 26 : 13;
+      ctx.lineCap = 'round';
+      for (var pass = 0; pass < 2; pass++) {
+        for (var i = 0; i < n; i++) {
+          var a = i * 2.399963 + (i % 2) * 0.35;
+          var f1 = (i * 0.618) % 1, f2 = (i * 0.377) % 1;
+          var r0 = R * (0.45 + 0.5 * f1);
+          var r1 = r0 + 3 + 5 * f2;
+          var w = 1 + f2 * 1.2;
+          var ca = Math.cos(a), sa = Math.sin(a);
+          if (pass === 0) {
+            ctx.strokeStyle = 'rgba(36,28,102,0.65)';
+            ctx.lineWidth = w + 1.7;
+          } else {
+            ctx.strokeStyle = 'rgba(150,138,255,0.95)';
+            ctx.lineWidth = w;
+          }
+          ctx.beginPath();
+          ctx.moveTo(px + ca * r0, py + sa * r0);
+          ctx.lineTo(px + ca * r1, py + sa * r1);
+          ctx.stroke();
+        }
+      }
+      drawEmber(px, py, 1, 0);
+    }
+
+    function frame(t) {
+      raf = null;
+      var dt = Math.min(0.05, (t - lastT) / 1000);
+      lastT = t;
+      ctx.clearRect(0, 0, W, H);
+      if (!on) { parts.length = 0; return; }
+
+      var since = t - lastMove;
+      var sinceAny = Math.min(since, t - lastBurst);
+
+      /* continuous emission at the cursor */
+      if (hasPos) {
+        var rate = 0;
+        if (since < P.activeMs) rate = P.rate;
+        else if (sinceAny < P.holdMs) {
+          var settle = (since - P.activeMs) / P.settleMs;
+          rate = P.simmerRate +
+            (P.rate - P.simmerRate) * Math.max(0, 1 - settle);
+        }
+        emitAcc += rate * dt;
+        while (emitAcc >= 1) {
+          emitAcc -= 1;
+          spawn(px + (Math.random() - 0.5) * 3, py + (Math.random() - 0.5) * 3,
+                P.ambSpeed, P.ambLife, P.ambSize);
+        }
+      }
+
+      /* physics */
+      var dragK = Math.exp(-P.drag * dt);
+      for (var i = parts.length - 1; i >= 0; i--) {
+        var p = parts[i];
+        p.life += dt;
+        if (p.life >= p.ttl) {
+          parts[i] = parts[parts.length - 1];
+          parts.pop();
+          continue;
+        }
+        p.vy += P.gravity * dt;
+        p.vx *= dragK; p.vy *= dragK;
+        p.x += p.vx * dt; p.y += p.vy * dt;
+      }
+
+      /* draw: dark underlay pass first, bright cores on top, so the rims
+         never cut across neighbouring cores */
+      /* Sparks moving fast are drawn as short streaks along their velocity
+         (a firework's radial energy); slow ones as dots. Dark rims first,
+         bright cores second, so rims never cut across cores. */
+      var n = parts.length, u, pr, sp, tx, ty;
+      ctx.lineCap = 'round';
+      for (i = 0; i < n; i++) {
+        p = parts[i]; u = 1 - p.life / p.ttl;
+        pr = p.r * (0.55 + 0.75 * u);
+        sp = p.vx * p.vx + p.vy * p.vy;
+        ctx.strokeStyle = ctx.fillStyle =
+          'hsla(' + p.h + ',55%,22%,' + (0.7 * u).toFixed(3) + ')';
+        if (sp > 4900) {                       /* > 70 px/s: streak */
+          var k = Math.min(1, 165 / Math.sqrt(sp)) * p.sk;
+          tx = p.x - p.vx * k; ty = p.y - p.vy * k;
+          ctx.lineWidth = 1.7 * pr + 1.7;
+          ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(p.x, p.y); ctx.stroke();
+        } else {
+          ctx.beginPath(); ctx.arc(p.x, p.y, pr + 0.9, 0, 6.2832); ctx.fill();
+        }
+      }
+      for (i = 0; i < n; i++) {
+        p = parts[i]; u = 1 - p.life / p.ttl;
+        pr = p.r * (0.55 + 0.75 * u);
+        sp = p.vx * p.vx + p.vy * p.vy;
+        /* fresh sparks flash hot near-white, then settle into deep
+           saturated violet before dying — the deep phase carries white
+           backgrounds, the hot phase carries dark ones */
+        ctx.strokeStyle = ctx.fillStyle =
+          'hsla(' + p.h + ',90%,' + (52 + 36 * u * u).toFixed(1) +
+          '%,' + Math.min(1, 1.3 * u).toFixed(3) + ')';
+        if (sp > 4900) {
+          var k2 = Math.min(1, 165 / Math.sqrt(sp)) * p.sk;
+          tx = p.x - p.vx * k2; ty = p.y - p.vy * k2;
+          ctx.lineWidth = 1.7 * pr + 0.3;
+          ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(p.x, p.y); ctx.stroke();
+        } else {
+          ctx.beginPath(); ctx.arc(p.x, p.y, pr, 0, 6.2832); ctx.fill();
+        }
+      }
+
+      /* click flash: a fast, small bloom under the burst */
+      var fb = t - lastBurst;
+      if (fb < 180 && hasPos) {
+        var fk = 1 - fb / 180;
+        var frr = 16 + 54 * (1 - fk);
+        var g = ctx.createRadialGradient(px, py, 0, px, py, frr);
+        g.addColorStop(0, 'rgba(235,232,255,' + (0.55 * fk) + ')');
+        g.addColorStop(0.5, 'rgba(124,108,240,' + (0.28 * fk) + ')');
+        g.addColorStop(1, 'rgba(124,108,240,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(px, py, frr, 0, 6.2832); ctx.fill();
+      }
+
+      /* the ember that marks the exact point, settling then fading */
+      var ember = 0;
+      if (hasPos) {
+        if (sinceAny < P.holdMs) ember = 1;
+        else if (sinceAny < P.holdMs + P.fadeMs)
+          ember = 1 - (sinceAny - P.holdMs) / P.fadeMs;
+      }
+      if (ember > 0) drawEmber(px, py, ember, t);
+
+      if (parts.length || (hasPos && sinceAny < P.holdMs + P.fadeMs)) start();
+    }
+
+    resize();
+
+    return {
+      resize: resize,
+      move: function (x, y) {
+        if (!on) return;
+        if (reduce) { px = x; py = y; hasPos = true; drawStill(false); return; }
+        if (hasPos) {
+          var dx = x - px, dy = y - py, d = Math.hypot(dx, dy);
+          if (d > P.trailPer) {
+            /* trail sparks along the travelled segment, inheriting a
+               little of the motion so flicks leave a comet tail */
+            var nT = Math.min(10, (d / P.trailPer) | 0);
+            var iv = Math.min(1, 190 / (d * 1.2));
+            var jx = -dy / d, jy = dx / d;      /* unit perpendicular */
+            for (var i = 0; i < nT; i++) {
+              var f = (i + 1) / nT;
+              var j = (Math.random() - 0.5) * 7; /* lateral scatter */
+              spawn(px + dx * f + jx * j, py + dy * f + jy * j,
+                    P.ambSpeed, P.ambLife * 0.8, P.ambSize,
+                    dx * 1.2 * iv, dy * 1.2 * iv);
+            }
+          }
+        }
+        px = x; py = y; hasPos = true;
+        lastMove = performance.now();
+        start();
+      },
+      burst: function (x, y) {
+        if (!on) return;
+        px = x; py = y; hasPos = true;
+        if (reduce) { drawStill(true); return; }
+        lastBurst = performance.now();
+        for (var i = 0; i < P.burstN; i++)
+          spawn(x, y, P.burstSpeed, P.burstLife, P.burstSize, 0, 0, true);
+        start();
+      },
+      toggle: function () {
+        on = !on;
+        if (!on) { parts.length = 0; ctx.clearRect(0, 0, W, H); }
+        else if (reduce) drawStill(false);
+        else start();
+        return on;
+      },
+      isOn: function () { return on; }
+    };
+  })();
+
+  /* ---------- zoom + pan ----------
+     Zooming resizes the layer holding the slide iframe rather than CSS-scaling
+     it, so the slide re-runs its own fitStage() and re-renders text crisply at
+     the new size instead of magnifying pixels. */
+
+  /* Slides are fixed-width compositions whose header and footer bars use
+     white-space:nowrap, so they clip if handed a viewport narrower than about
+     1440px. Never give them less than MIN_LOGICAL: below that the layer is
+     rendered at MIN_LOGICAL and scaled down, so slides shrink instead of
+     clipping. At or above it we hand over real pixels and skip the transform,
+     which is what keeps zoomed text genuinely crisp. */
+  /* Slides are fixed-width compositions whose header and footer bars use
+     white-space:nowrap, so they clip if handed a viewport narrower than about
+     1440px. Never lay one out below MIN_LOGICAL. */
+  var MIN_LOGICAL = 1520;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  /* Wheel deltas differ wildly by device: one mouse notch is ~100px (or 3
+     "lines"), while a trackpad streams many small pixel deltas. Normalise to
+     pixels first, otherwise a fixed per-event step makes the mouse leap and
+     the trackpad rocket. */
+  function wheelPixels(deltaY, deltaMode) {
+    var d = deltaY;
+    if (deltaMode === 1) d *= 16;
+    else if (deltaMode === 2) d *= 400;
+    return clamp(d, -260, 260);
+  }
+
+  function makeZoom(host, layer, onChange) {
+    var MAXZ = 6, EASE = 0.2;
+    var z = 1, ox = 0, oy = 0;        // what is on screen right now
+    var tz = 1, tox = 0, toy = 0;     // where it is heading
+    var L = 0;                        // logical width the layer is laid out at
+    var anim = null, settle = null, drag = null, lastPct = -1;
+
+    function panFloor(zz) {
+      return { x: Math.min(0, host.clientWidth * (1 - zz)),
+               y: Math.min(0, host.clientHeight * (1 - zz)) };
+    }
+
+    function clampTarget() {
+      var f = panFloor(tz);
+      tox = clamp(tox, f.x, 0);
+      toy = clamp(toy, f.y, 0);
+    }
+
+    /* Resizing the layer relays out the slide inside it, which is what makes
+       zoomed text crisp -- but it is a reflow, so we only do it when a gesture
+       has settled, and animate with a cheap transform in between. */
+    function layout(force) {
+      var w = host.clientWidth, h = host.clientHeight;
+      if (!w || !h) return;
+      var want = Math.max(MIN_LOGICAL, w * tz);
+      if (force || !L || Math.abs(want - L) > 0.5) {
+        L = want;
+        layer.style.width = L + 'px';
+        layer.style.height = (L * h / w) + 'px';
+      }
+    }
+
+    function render() {
+      var w = host.clientWidth;
+      if (!w || !L) return;
+      var f = panFloor(z);
+      ox = clamp(ox, f.x, 0);
+      oy = clamp(oy, f.y, 0);
+      layer.style.transformOrigin = '0 0';
+      layer.style.transform =
+        'translate(' + ox + 'px,' + oy + 'px) scale(' + (w * z / L) + ')';
+      host.classList.toggle('is-zoomed', tz > 1.001);
+      var p = Math.round(tz * 100);
+      if (onChange && p !== lastPct) { lastPct = p; onChange(tz); }
+    }
+
+    function scheduleSettle() {
+      if (settle) clearTimeout(settle);
+      settle = setTimeout(function () {
+        settle = null;
+        layout(false);
+        render();
+      }, 130);
+    }
+
+    function tick() {
+      anim = null;
+      z += (tz - z) * EASE;
+      ox += (tox - ox) * EASE;
+      oy += (toy - oy) * EASE;
+      if (Math.abs(tz - z) < 0.0008 &&
+          Math.abs(tox - ox) < 0.4 && Math.abs(toy - oy) < 0.4) {
+        z = tz; ox = tox; oy = toy;
+        render();
+        scheduleSettle();
+        return;
+      }
+      render();
+      anim = requestAnimationFrame(tick);
+    }
+
+    function start() { if (anim === null) anim = requestAnimationFrame(tick); }
+
+    function setTarget(nz, cx, cy) {
+      var z0 = tz, z1 = clamp(nz, 1, MAXZ);
+      if (Math.abs(z1 - z0) < 1e-4) return;
+      tox = cx - (cx - tox) * (z1 / z0);
+      toy = cy - (cy - toy) * (z1 / z0);
+      tz = z1;
+      clampTarget();
+      if (!L) layout(true);
+      start();
+      scheduleSettle();
+    }
+
+    return {
+      apply: function () {
+        layout(true);
+        z = tz; clampTarget(); ox = tox; oy = toy;
+        render();
+      },
+      get: function () { return tz; },
+      wheel: function (cx, cy, px) { setTarget(tz * Math.exp(-px * 0.0014), cx, cy); },
+      step: function (factor) {
+        setTarget(tz * factor, host.clientWidth / 2, host.clientHeight / 2);
+      },
+      toggleAt: function (cx, cy) { setTarget(tz > 1.001 ? 1 : 2.5, cx, cy); },
+      reset: function () { tz = 1; tox = 0; toy = 0; start(); scheduleSettle(); },
+      dragStart: function (sx, sy) {
+        if (tz <= 1.001) return false;
+        drag = { sx: sx, sy: sy, ox: tox, oy: toy };
+        host.classList.add('is-panning');
+        return true;
+      },
+      dragMove: function (sx, sy) {
+        if (!drag) return false;
+        tox = drag.ox + (sx - drag.sx);
+        toy = drag.oy + (sy - drag.sy);
+        clampTarget();
+        ox = tox; oy = toy;          // panning tracks the hand exactly, no easing
+        render();
+        return true;
+      },
+      dragEnd: function () {
+        if (!drag) return false;
+        drag = null;
+        host.classList.remove('is-panning');
+        return true;
+      },
+      dragging: function () { return !!drag; }
+    };
+  }
+
+  function pct(z) { return Math.round(z * 100) + '%'; }
+
+  var stageZoomer = makeZoom(stage, document.getElementById('stage-zoom'), function (z) {
+    document.getElementById('zoom-level').textContent = pct(z);
+    document.getElementById('btn-zoom-out').disabled = z <= 1.001;
+    document.getElementById('btn-zoom-reset').disabled = z <= 1.001;
+    document.getElementById('btn-zoom-in').disabled = z >= 5.99;
+  });
+
+  var exploreZoomer = makeZoom(
+    document.getElementById('explore-viewport'),
+    document.getElementById('explore-zoom'),
+    function (z) {
+      document.getElementById('ex-zoom-level').textContent = pct(z);
+      document.getElementById('btn-ex-zoom-out').disabled = z <= 1.001;
+      document.getElementById('btn-ex-zoom-reset').disabled = z <= 1.001;
+      document.getElementById('btn-ex-zoom-in').disabled = z >= 5.99;
+    }
+  );
+
+  function activeZoomer() {
+    return exploreOverlay.classList.contains('is-open') ? exploreZoomer : stageZoomer;
+  }
+
+  /* ---------- loading ---------- */
+
+  function previewDoc(source) {
+    var css = '<style id="deck-preview-style">' +
+      '.controlbar button{display:none!important}' +
+      'button,a,[tabindex]{pointer-events:none!important}' +
+      '</style>';
+    return source.replace(/<head([^>]*)>/i, '<head$1>' + css);
+  }
+
+  function exploreDoc(source) {
+    // The explore iframe stays interactive, so the parent cannot see pointer or
+    // wheel input over it. This reporter forwards what the deck needs.
+    var js = '<script id="deck-explore-reporter">(function(){' +
+      'if(window.parent===window)return;' +
+      'function send(t,e,x){var m={type:t,x:e.clientX,y:e.clientY,sx:e.screenX,sy:e.screenY};' +
+      'if(x)for(var k in x)m[k]=x[k];try{parent.postMessage(m,"*");}catch(_){}}' +
+      'addEventListener("pointermove",function(e){send("deckui:pointermove",e);},true);' +
+      'addEventListener("pointerdown",function(e){send("deckui:pointerdown",e,{button:e.button});},true);' +
+      'addEventListener("pointerup",function(e){send("deckui:pointerup",e);},true);' +
+      'addEventListener("wheel",function(e){e.preventDefault();send("deckui:wheel",e,{dy:e.deltaY,dm:e.deltaMode});},' +
+      '{capture:true,passive:false});' +
+      'addEventListener("message",function(ev){var d=ev.data;if(!d||d.type!=="deckui:cursor")return;' +
+      'document.documentElement.style.cursor=d.value||"";});' +
+      '})();<\/script>';
+    return source.replace(/<head([^>]*)>/i, '<head$1>' + js);
+  }
+
+  function ensureLoaded(idx) {
+    if (idx < 0 || idx >= TOTAL) return;
+    var f = frames[idx];
+    if (f.dataset.loaded) return;
+    f.dataset.loaded = '1';
+    if (slideDocs[idx] != null) {
+      // Single-file build: the document is inlined on the element itself.
+      f.srcdoc = previewDoc(slideDocs[idx]);
+      f.removeAttribute('data-doc');   // slideDocs owns the interactive source copy
+    } else {
+      f.setAttribute('src', SLIDES[idx].file);
+    }
+  }
+
+  function ensureWindowLoaded(idx) {
+    ensureLoaded(idx);
+    for (var d = 1; d <= LOAD_AHEAD; d++) {
+      ensureLoaded(idx + d);
+      ensureLoaded(idx - d);
+    }
+  }
+
+  function post(idx, msg) {
+    var f = frames[idx];
+    if (!f || !f.contentWindow) return;
+    try { f.contentWindow.postMessage(msg, '*'); } catch (e) { /* not loaded yet */ }
+  }
+
+  /* ---------- navigation ---------- */
+
+  function go(idx, opts) {
+    idx = Math.max(0, Math.min(TOTAL - 1, idx));
+    var changed = idx !== current;
+    current = idx;
+    if (idx > seen) seen = idx;
+
+    if (changed) stageZoomer.reset();
+
+    ensureWindowLoaded(idx);
+
+    frames.forEach(function (f, i) { f.classList.toggle('is-current', i === idx); });
+
+    // A slide that was loaded while off-stage may have measured itself at the
+    // wrong size; ask it to re-fit now that it is the visible one.
+    post(idx, { type: 'deck:fit' });
+    post(idx, { type: 'deck:state' });
+
+    // Leaving a slide should not leave its autoplay running.
+    if (changed) frames.forEach(function (f, i) { if (i !== idx) post(i, { type: 'deck:pause' }); });
+
+    if (!(opts && opts.keepHash)) {
+      var h = '#' + (idx + 1);
+      if (location.hash !== h) history.replaceState(null, '', h);
+    }
+
+    render();
+  }
+
+  function render() {
+    var s = SLIDES[current];
+    railEyebrow.textContent = s.eyebrow;
+    counter.innerHTML = '<b>' + (current + 1) + '</b> / ' + TOTAL;
+
+    segs.forEach(function (seg, i) {
+      seg.classList.toggle('is-current', i === current);
+      seg.classList.toggle('is-seen', i !== current && i <= seen);
+      seg.setAttribute('aria-selected', String(i === current));
+    });
+
+    cards.forEach(function (c, i) { c.classList.toggle('is-current', i === current); });
+
+    btnPrev.disabled = current === 0;
+    btnNext.disabled = current === TOTAL - 1;
+
+    document.documentElement.style.setProperty('--seg-color', ARC_COLOR[s.arc]);
+  }
+
+  function advance() {
+    if (current < TOTAL - 1) go(current + 1);
+  }
+
+  function retreat() {
+    if (current > 0) go(current - 1);
+  }
+
+  /* ---------- overlays ---------- */
+
+  var overlays = {
+    overview: document.getElementById('ov-overview'),
+    notes: document.getElementById('ov-notes'),
+    help: document.getElementById('ov-help')
+  };
+
+  function anyOverlayOpen() {
+    return exploreOverlay.classList.contains('is-open') ||
+      Object.keys(overlays).some(function (k) { return overlays[k].classList.contains('is-open'); });
+  }
+
+  function closeExplore(restoreFocus) {
+    var wasOpen = exploreOverlay.classList.contains('is-open');
+    exploreOverlay.classList.remove('is-open');
+    exploreFrame.removeAttribute('srcdoc');
+    exploreZoomer.reset();
+    exploreFrame.src = 'about:blank';
+    if (wasOpen && restoreFocus !== false && exploreReturnFocus && exploreReturnFocus.focus) {
+      exploreReturnFocus.focus();
+    }
+    exploreReturnFocus = null;
+  }
+
+  function closeOverlays(restoreFocus) {
+    Object.keys(overlays).forEach(function (k) { overlays[k].classList.remove('is-open'); });
+    closeExplore(restoreFocus);
+    syncToggles();
+  }
+
+  function openExplore() {
+    var source = slideDocs[current];
+    if (!source) return;
+    closeOverlays(false);
+    exploreReturnFocus = document.activeElement;
+    document.getElementById('explore-subtitle').textContent =
+      (current + 1) + ' / ' + TOTAL + ' · ' + SLIDES[current].title;
+    exploreZoomer.reset();
+    exploreFrame.srcdoc = exploreDoc(source);
+    exploreOverlay.classList.add('is-open');
+    exploreOverlay.querySelector('[data-close-explore]').focus();
+  }
+
+  function toggleOverlay(name) {
+    var was = overlays[name].classList.contains('is-open');
+    closeOverlays();
+    if (!was) {
+      if (name === 'notes') fillNotes();
+      overlays[name].classList.add('is-open');
+      var first = overlays[name].querySelector('[data-close]');
+      if (first) first.focus();
+    }
+    syncToggles();
+  }
+
+  function fillNotes() {
+    var s = SLIDES[current];
+    var wrap = overlays.notes.querySelector('.notes-wrap');
+    wrap.style.setProperty('--seg-color', ARC_COLOR[s.arc]);
+    document.getElementById('notes-eyebrow').textContent = s.eyebrow;
+    document.getElementById('notes-title').textContent = s.title;
+    document.getElementById('notes-body').textContent = s.notes;
+  }
+
+  function syncToggles() {
+    document.getElementById('btn-overview').classList.toggle('is-on', overlays.overview.classList.contains('is-open'));
+    document.getElementById('btn-notes').classList.toggle('is-on', overlays.notes.classList.contains('is-open'));
+    document.getElementById('btn-present').classList.toggle('is-on', document.body.classList.contains('is-presenting'));
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('[data-close]'), function (b) {
+    b.addEventListener('click', closeOverlays);
+  });
+
+  Object.keys(overlays).forEach(function (k) {
+    overlays[k].addEventListener('click', function (ev) {
+      if (ev.target === overlays[k]) closeOverlays();
+    });
+  });
+
+  document.querySelector('[data-close-explore]').addEventListener('click', function () {
+    closeExplore(true);
+  });
+
+  exploreOverlay.addEventListener('click', function (ev) {
+    if (ev.target === exploreOverlay) closeExplore(true);
+  });
+
+  /* ---------- present mode ---------- */
+
+  function togglePresent() {
+    var el = document.documentElement;
+    if (!document.fullscreenElement) {
+      if (el.requestFullscreen) el.requestFullscreen().catch(function () { setPresenting(true); });
+      else setPresenting(true);
+    } else if (document.exitFullscreen) {
+      document.exitFullscreen();
+    } else {
+      setPresenting(false);
+    }
+  }
+
+  function setPresenting(on) {
+    document.body.classList.toggle('is-presenting', on);
+    syncToggles();
+    fitStage();
+    post(current, { type: 'deck:fit' });
+  }
+
+  document.addEventListener('fullscreenchange', function () {
+    setPresenting(!!document.fullscreenElement);
+  });
+
+  /* ---------- messages from slides ---------- */
+
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!d || typeof d !== 'object') return;
+
+    if (exploreFrame.contentWindow === ev.source) {
+      if (d.type && d.type.indexOf('deckui:') === 0) {
+        var r = exploreFrame.getBoundingClientRect();
+        var vp = document.getElementById('explore-viewport').getBoundingClientRect();
+        if (d.type === 'deckui:pointermove') {
+          fx.move(r.left + d.x, r.top + d.y);
+          if (exploreZoomer.dragging()) { exploreZoomer.dragMove(d.sx, d.sy); }
+          else if (exPending && exploreZoomer.get() > 1.001 &&
+                   Math.hypot(d.sx - exPending.sx, d.sy - exPending.sy) > 4) {
+            exploreZoomer.dragStart(exPending.sx, exPending.sy);
+            exploreZoomer.dragMove(d.sx, d.sy);
+            exploreFrame.contentWindow.postMessage({ type: 'deckui:cursor', value: 'grabbing' }, '*');
+          }
+        } else if (d.type === 'deckui:pointerdown') {
+          fx.burst(r.left + d.x, r.top + d.y);
+          if (d.button === 0) exPending = { sx: d.sx, sy: d.sy };
+        } else if (d.type === 'deckui:pointerup') {
+          exPending = null;
+          if (exploreZoomer.dragEnd()) {
+            exploreFrame.contentWindow.postMessage({ type: 'deckui:cursor', value: '' }, '*');
+          }
+        } else if (d.type === 'deckui:wheel') {
+          exploreZoomer.wheel(r.left + d.x - vp.left, r.top + d.y - vp.top,
+            wheelPixels(d.dy, d.dm));
+        }
+        return;
+      }
+      if (d.type === 'slide:key') {
+        switch (d.key) {
+          case 'ArrowRight': case 'ArrowDown': case 'PageDown': case ' ': case 'Spacebar':
+            exploreFrame.contentWindow.postMessage({ type: 'deck:next' }, '*'); break;
+          case 'ArrowLeft': case 'ArrowUp': case 'PageUp':
+            exploreFrame.contentWindow.postMessage({ type: 'deck:prev' }, '*'); break;
+          case 'Home': case 'r': case 'R':
+            exploreFrame.contentWindow.postMessage({ type: 'deck:reset' }, '*'); break;
+          case 'p': case 'P':
+            exploreFrame.contentWindow.postMessage({ type: 'deck:play' }, '*'); break;
+          case 'Escape':
+            closeExplore(true); break;
+        }
+      }
+      return;
+    }
+
+    var idx = -1;
+    for (var i = 0; i < frames.length; i++) {
+      if (frames[i].contentWindow === ev.source) { idx = i; break; }
+    }
+    if (idx === -1) return;
+
+    if (d.type === 'slide:state') {
+      state[idx] = {
+        hasSteps: !!d.hasSteps,
+        step: d.step | 0,
+        total: d.total | 0,
+        atStart: !!d.atStart,
+        atEnd: !!d.atEnd,
+        ready: true
+      };
+      if (idx === current) render();
+    } else if (d.type === 'slide:ready') {
+      post(idx, { type: 'deck:state' });
+    } else if (d.type === 'slide:key') {
+      handleKey(d.key, true);
+    }
+  });
+
+  /* ---------- keyboard ---------- */
+
+  function handleKey(key, fromSlide) {
+    if (anyOverlayOpen()) {
+      if (key === 'Escape') closeOverlays();
+      return;
+    }
+
+    switch (key) {
+      case 'ArrowRight': case 'PageDown': case ' ': case 'Spacebar':
+        advance(); return;
+      case 'ArrowLeft': case 'PageUp':
+        retreat(); return;
+      case 'ArrowDown':
+        advance(); return;
+      case 'ArrowUp':
+        retreat(); return;
+      case 'Home': go(0); return;
+      case 'End': go(TOTAL - 1); return;
+      case 'o': case 'O': toggleOverlay('overview'); return;
+      case 'n': case 'N': toggleOverlay('notes'); return;
+      case '?': toggleOverlay('help'); return;
+      case 'f': case 'F': togglePresent(); return;
+      case '+': case '=': activeZoomer().step(1.25); return;
+      case '-': case '_': activeZoomer().step(1 / 1.25); return;
+      case '0': activeZoomer().reset(); return;
+      case 'l': case 'L': setPointer(fx.toggle()); return;
+      case 'Escape':
+        if (document.body.classList.contains('is-presenting')) togglePresent();
+        return;
+    }
+
+    if (key >= '0' && key <= '9') {
+      var n = key === '0' ? 10 : parseInt(key, 10);
+      if (n <= TOTAL) go(n - 1);
+    }
+  }
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var t = ev.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+
+    // Let Space and Enter activate a focused chrome button normally.
+    if ((ev.key === ' ' || ev.key === 'Enter') && t && t.tagName === 'BUTTON') return;
+
+    var handled = [
+      'ArrowRight', 'ArrowLeft', 'ArrowUp', 'ArrowDown', 'PageDown', 'PageUp',
+      'Home', 'End', ' ', 'Spacebar', 'Escape', '?',
+      'o', 'O', 'n', 'N', 'f', 'F', 'l', 'L', '+', '=', '-', '_',
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
+    ].indexOf(ev.key) !== -1;
+
+    if (!handled) return;
+    ev.preventDefault();
+    handleKey(ev.key, false);
+  });
+
+  /* ---------- wiring ---------- */
+
+  btnPrev.addEventListener('click', retreat);
+  btnNext.addEventListener('click', advance);
+  btnExplore.addEventListener('click', openExplore);
+
+  /* ---------- pointer FX + stage zoom input ----------
+     Slides are pointer-events:none in the deck view, so the stage element sees
+     every mouse event over them and no injection is needed here. */
+
+  function setPointer(on) {
+    document.getElementById('btn-pointer').classList.toggle('is-on', on);
+    document.getElementById('btn-pointer').setAttribute('aria-pressed', String(on));
+  }
+
+  document.addEventListener('pointermove', function (ev) { fx.move(ev.clientX, ev.clientY); });
+  document.addEventListener('pointerdown', function (ev) { fx.burst(ev.clientX, ev.clientY); });
+
+  document.getElementById('btn-pointer').addEventListener('click', function () {
+    setPointer(fx.toggle());
+  });
+
+  stage.addEventListener('wheel', function (ev) {
+    ev.preventDefault();
+    var r = stage.getBoundingClientRect();
+    stageZoomer.wheel(ev.clientX - r.left, ev.clientY - r.top,
+      wheelPixels(ev.deltaY, ev.deltaMode));
+  }, { passive: false });
+
+  stage.addEventListener('pointerdown', function (ev) {
+    if (ev.button !== 0 || ev.target.closest('.explore-button')) return;
+    if (stageZoomer.dragStart(ev.clientX, ev.clientY)) {
+      try { stage.setPointerCapture(ev.pointerId); } catch (e) {}
+      ev.preventDefault();
+    }
+  });
+  stage.addEventListener('pointermove', function (ev) { stageZoomer.dragMove(ev.clientX, ev.clientY); });
+  stage.addEventListener('pointerup', function () { stageZoomer.dragEnd(); });
+  stage.addEventListener('pointercancel', function () { stageZoomer.dragEnd(); });
+
+  stage.addEventListener('dblclick', function (ev) {
+    if (ev.target.closest('.explore-button')) return;
+    var r = stage.getBoundingClientRect();
+    stageZoomer.toggleAt(ev.clientX - r.left, ev.clientY - r.top);
+  });
+
+  document.getElementById('btn-zoom-in').addEventListener('click', function () { stageZoomer.step(1.25); });
+  document.getElementById('btn-zoom-out').addEventListener('click', function () { stageZoomer.step(1 / 1.25); });
+  document.getElementById('btn-zoom-reset').addEventListener('click', function () { stageZoomer.reset(); });
+
+  document.getElementById('btn-ex-zoom-in').addEventListener('click', function () { exploreZoomer.step(1.25); });
+  document.getElementById('btn-ex-zoom-out').addEventListener('click', function () { exploreZoomer.step(1 / 1.25); });
+  document.getElementById('btn-ex-zoom-reset').addEventListener('click', function () { exploreZoomer.reset(); });
+
+  document.getElementById('explore-viewport').addEventListener('wheel', function (ev) {
+    ev.preventDefault();
+    var r = ev.currentTarget.getBoundingClientRect();
+    exploreZoomer.wheel(ev.clientX - r.left, ev.clientY - r.top,
+      wheelPixels(ev.deltaY, ev.deltaMode));
+  }, { passive: false });
+
+  setPointer(fx.isOn());
+  document.getElementById('btn-overview').addEventListener('click', function () { toggleOverlay('overview'); });
+  document.getElementById('btn-notes').addEventListener('click', function () { toggleOverlay('notes'); });
+  document.getElementById('btn-help').addEventListener('click', function () { toggleOverlay('help'); });
+  document.getElementById('btn-present').addEventListener('click', togglePresent);
+
+  window.addEventListener('resize', function () {
+    fx.resize();
+    fitStage();
+    post(current, { type: 'deck:fit' });
+  });
+
+  window.addEventListener('hashchange', function () {
+    var n = parseInt((location.hash || '').replace('#', ''), 10);
+    if (n >= 1 && n <= TOTAL && n - 1 !== current) go(n - 1, { keepHash: true });
+  });
+
+  /* ---------- start ---------- */
+
+  fitStage();
+
+  var startN = parseInt((location.hash || '').replace('#', ''), 10);
+  go(startN >= 1 && startN <= TOTAL ? startN - 1 : 0);
+
+  window.__deckDiagnostics = function () {
+    return {
+      total: TOTAL,
+      sourceDocs: slideDocs.filter(Boolean).length,
+      current: current,
+      exploreOpen: exploreOverlay.classList.contains('is-open')
+    };
+  };
+
+  // Slides that finished loading before the deck was ready never got a fit ping.
+  window.addEventListener('load', function () {
+    fitStage();
+    post(current, { type: 'deck:fit' });
+    post(current, { type: 'deck:state' });
+  });
+})();
+</script>
+</body>
+</html>

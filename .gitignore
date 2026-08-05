@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# build output: decks are rebuilt from their shell + slide files
+deck.html
+out.png
