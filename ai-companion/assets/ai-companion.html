@@ -1,0 +1,712 @@
+<!--
+  ai-companion snippet -- paste this whole block right before </body> in any
+  HTML page. It is fully self-contained (styles, markup, the bridge server's
+  source, and the panel's logic) and works standalone with zero dependency
+  on the host page's CSS -- every custom property below has a fallback.
+
+  If the host page defines matching --chrome-ink / --surround-2 / etc custom
+  properties (e.g. a live-deck deck), the widget picks those up and blends
+  in instead of using its own defaults.
+
+  See reference/context-provider.md to hook window.AI_COMPANION_CONTEXT()
+  for pages with a "current section" concept (tabs, slides, wizard steps).
+  See reference/protocol.md for the HTTP API this talks to.
+-->
+<style>
+  .aic-toggle {
+    position: fixed;
+    right: 20px;
+    bottom: calc(var(--rail-h, 0px) + 20px);
+    z-index: 9000;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    background: var(--surround-2, #131c2c);
+    color: var(--chrome-ink, #e8eef7);
+    font: 600 13px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif);
+    cursor: pointer;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.32);
+  }
+  .aic-toggle:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); }
+  .aic-toggle .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #64748b; flex: none;
+  }
+  .aic-toggle.is-connected .dot { background: var(--arc-converge, #249c62); }
+
+  .aic-panel {
+    position: fixed;
+    right: 20px;
+    bottom: calc(var(--rail-h, 0px) + 76px);
+    width: 380px;
+    max-width: calc(100vw - 40px);
+    height: min(560px, 70vh);
+    z-index: 9001;
+    display: flex;
+    flex-direction: column;
+    background: var(--overlay-bg, rgba(6, 11, 20, 0.985));
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    border-radius: 14px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+    font: 13px/1.5 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif);
+    color: var(--chrome-ink, #e8eef7);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(8px) scale(0.98);
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease, width 0.15s ease, height 0.15s ease, visibility 0s linear 0.15s;
+  }
+  .aic-panel.is-open {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    pointer-events: auto;
+    transition: opacity 0.15s ease, transform 0.15s ease, width 0.15s ease, height 0.15s ease;
+  }
+  .aic-panel.is-expanded {
+    width: 640px;
+    height: min(760px, 84vh);
+  }
+  .aic-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    flex: none;
+  }
+  .aic-head strong { display: block; font-size: 13px; }
+  .aic-status { display: block; margin-top: 2px; font-size: 11px; color: var(--chrome-muted, #8b9bb4); }
+  .aic-head-actions { display: flex; gap: 4px; flex: none; }
+  .aic-head-actions button {
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    background: transparent;
+    color: var(--chrome-muted, #8b9bb4);
+    border-radius: 7px;
+    padding: 4px 8px;
+    font: 500 11px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif);
+    cursor: pointer;
+  }
+  .aic-head-actions button:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); color: var(--chrome-ink, #e8eef7); }
+  .aic-head-actions button.is-on { color: var(--arc-consumption, #1677c8); border-color: var(--arc-consumption, #1677c8); }
+
+  .aic-view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  .aic-view[hidden] { display: none; } /* the display:flex above beats the UA [hidden] default at equal specificity -- restate it explicitly */
+
+  .aic-log {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .aic-turn .q { color: var(--chrome-muted, #8b9bb4); font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
+  .aic-turn .a { color: var(--prose, #cbd6e6); white-space: pre-wrap; }
+  .aic-turn .ctx-tag {
+    display: inline-block; font-size: 10px; color: var(--chrome-muted, #8b9bb4);
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); border-radius: 5px; padding: 1px 5px; margin-bottom: 4px;
+  }
+  .aic-turn.is-pending .a { color: var(--chrome-muted, #8b9bb4); font-style: italic; }
+  .aic-turn.is-error .a { color: #ef4444; }
+  .aic-turn.is-cancelled .a { color: var(--chrome-muted, #8b9bb4); }
+  .aic-pending-row { display: flex; align-items: center; gap: 8px; }
+  .aic-cancel-btn {
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: transparent; color: var(--chrome-muted, #8b9bb4);
+    border-radius: 6px; padding: 1px 7px; font: 500 10.5px/1.6 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); cursor: pointer; flex: none;
+  }
+  .aic-cancel-btn:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); color: var(--chrome-ink, #e8eef7); }
+
+  .aic-empty { padding: 4px 2px 12px; }
+  .aic-empty p { margin: 0 0 8px; }
+  .aic-empty ol { margin: 0 0 10px; padding-left: 18px; }
+  .aic-empty li { margin-bottom: 8px; }
+  .aic-cmd { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .aic-cmd code {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03)); border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); border-radius: 5px;
+    padding: 3px 6px; font-size: 11.5px; flex: 1 1 auto; overflow-x: auto; white-space: nowrap;
+  }
+  .aic-export-btn, .aic-cmd button {
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: transparent; color: var(--chrome-ink, #e8eef7);
+    border-radius: 6px; padding: 4px 10px; font: 600 11px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); cursor: pointer; flex: none;
+  }
+  .aic-export-btn:hover, .aic-cmd button:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); }
+
+  .aic-context-chip {
+    display: flex; align-items: center; gap: 6px;
+    margin: 0 14px 8px; padding: 4px 8px;
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); border-radius: 999px;
+    font-size: 11px; color: var(--chrome-muted, #8b9bb4); flex: none; width: fit-content;
+  }
+  .aic-context-chip[hidden] { display: none; }
+  .aic-context-chip.is-excluded { opacity: 0.55; text-decoration: line-through; }
+  .aic-context-chip button {
+    border: none; background: transparent; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; padding: 0;
+  }
+
+  .aic-input-row {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    flex: none;
+  }
+  .aic-input-row textarea {
+    flex: 1 1 auto;
+    resize: none;
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    border-radius: 8px;
+    color: var(--chrome-ink, #e8eef7);
+    font: 13px/1.4 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif);
+    padding: 7px 9px;
+  }
+  .aic-input-row button {
+    flex: none;
+    border: none;
+    border-radius: 8px;
+    background: var(--arc-consumption, #1677c8);
+    color: #fff;
+    font: 600 12px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif);
+    padding: 0 14px;
+    cursor: pointer;
+  }
+  .aic-input-row button:disabled { opacity: 0.5; cursor: default; }
+
+  .aic-hint {
+    margin: 0; padding: 0 14px 12px; font-size: 11.5px; color: var(--chrome-muted, #8b9bb4); flex: none;
+  }
+  .aic-hint code {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03)); border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    border-radius: 4px; padding: 0 4px; font-size: 11px;
+  }
+
+  .aic-settings-scroll { flex: 1 1 auto; overflow-y: auto; padding: 6px 14px 14px; }
+  .aic-back {
+    border: none; background: transparent; color: var(--chrome-muted, #8b9bb4); cursor: pointer;
+    font: 600 12px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); padding: 8px 0; margin-bottom: 4px;
+  }
+  .aic-back:hover { color: var(--chrome-ink, #e8eef7); }
+  .aic-settings-section { padding: 10px 0; border-top: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); }
+  .aic-settings-section:first-of-type { border-top: none; }
+  .aic-settings-section h4 { margin: 0 0 6px; font-size: 12px; }
+  .aic-kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 11.5px; }
+  .aic-kv dt { color: var(--chrome-muted, #8b9bb4); }
+  .aic-kv dd { margin: 0; word-break: break-all; }
+  .aic-settings-hint, .aic-settings-status { margin: 4px 0 0; font-size: 11px; color: var(--chrome-muted, #8b9bb4); }
+  .aic-settings-status.is-error { color: #ef4444; }
+  .aic-settings-status.is-ok { color: var(--arc-converge, #249c62); }
+  .aic-candidates { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }
+  .aic-candidate {
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: var(--card-bg, rgba(255, 255, 255, 0.03)); color: var(--chrome-ink, #e8eef7);
+    border-radius: 6px; padding: 3px 7px; font: 500 10.5px/1.4 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); cursor: pointer; max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .aic-candidate:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); }
+  .aic-settings-row { display: flex; gap: 6px; margin-top: 6px; }
+  .aic-settings-row input {
+    flex: 1 1 auto; background: var(--card-bg, rgba(255, 255, 255, 0.03)); border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); border-radius: 7px;
+    color: var(--chrome-ink, #e8eef7); font: 12px/1.4 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); padding: 6px 8px; min-width: 0;
+  }
+  .aic-settings-row button {
+    flex: none; border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: transparent; color: var(--chrome-ink, #e8eef7);
+    border-radius: 7px; font: 600 11.5px/1 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); padding: 0 10px; cursor: pointer;
+  }
+  .aic-settings-row button:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); }
+  .aic-settings-row button.aic-settings-save {
+    background: var(--arc-consumption, #1677c8); border-color: var(--arc-consumption, #1677c8); color: #fff;
+  }
+</style>
+
+<button class="aic-toggle" id="aicToggle" type="button">
+  <span class="dot" id="aicDot"></span><span id="aicToggleLabel">AI Companion</span>
+</button>
+
+<aside class="aic-panel" id="aicPanel" aria-hidden="true">
+  <header class="aic-head">
+    <div>
+      <strong id="aicHeadLabel">AI Companion</strong>
+      <span class="aic-status" id="aicStatus">Checking for a local AI session…</span>
+    </div>
+    <div class="aic-head-actions">
+      <button id="aicExpandBtn" type="button" title="Expand panel" aria-label="Expand panel">&#8599;</button>
+      <button id="aicSettingsBtn" type="button" title="Settings" aria-label="Settings">&#9881;</button>
+      <button id="aicReset" type="button" title="Clear the conversation">Clear</button>
+      <button id="aicClose" type="button" aria-label="Close">&times;</button>
+    </div>
+  </header>
+
+  <div class="aic-view aic-view-chat" id="aicViewChat">
+    <div class="aic-log" id="aicLog">
+      <div class="aic-empty" id="aicEmpty" hidden>
+        <p><strong>Not connected to a local AI session.</strong></p>
+        <ol>
+          <li>Click <b>Export script</b> to download <code>ai_companion_server.py</code> next to this page.</li>
+          <li>Run it in a terminal:
+            <div class="aic-cmd">
+              <code id="aicCmd">python3 ai_companion_server.py</code>
+              <button id="aicCopyCmd" type="button" title="Copy command">Copy</button>
+            </div>
+            <p class="aic-settings-hint">Add <code>--repo /path/to/repo</code> if the real codebase isn't in this folder (or set it later in Settings). On Windows: <code>python ai_companion_server.py</code>.</p>
+          </li>
+          <li>This page reconnects automatically once it's running.</li>
+        </ol>
+        <button id="aicExportEmpty" type="button" class="aic-export-btn">Export script</button>
+      </div>
+    </div>
+    <div class="aic-context-chip" id="aicContextChip" hidden>
+      <span id="aicContextChipLabel"></span>
+      <button id="aicContextChipToggle" type="button" title="Exclude the current context from questions">&times;</button>
+    </div>
+    <form class="aic-input-row" id="aicForm">
+      <textarea id="aicInput" placeholder="Ask a question…" rows="2"></textarea>
+      <button type="submit" id="aicSend">Send</button>
+    </form>
+  </div>
+
+  <div class="aic-view aic-view-settings" id="aicViewSettings" hidden>
+    <div class="aic-settings-scroll">
+      <button class="aic-back" id="aicSettingsBack" type="button">&larr; Back to chat</button>
+
+      <section class="aic-settings-section">
+        <h4>Connection</h4>
+        <dl class="aic-kv" id="aicConnKV"></dl>
+      </section>
+
+      <section class="aic-settings-section">
+        <h4>Codebase path</h4>
+        <p class="aic-settings-hint">The directory the AI reads as source code. Changing it starts a new conversation.</p>
+        <div class="aic-settings-row">
+          <input type="text" id="aicRepoPath" placeholder="/path/to/repo" autocomplete="off" spellcheck="false">
+          <button id="aicRepoBrowse" type="button">Browse…</button>
+        </div>
+        <div class="aic-settings-row">
+          <button id="aicRepoSave" type="button" class="aic-settings-save">Save</button>
+        </div>
+        <p class="aic-settings-status" id="aicRepoStatus"></p>
+      </section>
+
+      <section class="aic-settings-section">
+        <h4>Copilot executable (Windows)</h4>
+        <p class="aic-settings-hint">Only needed if <code>copilot</code> isn't on PATH or you want a specific install.</p>
+        <div class="aic-candidates" id="aicCopilotCandidates"></div>
+        <div class="aic-settings-row">
+          <input type="text" id="aicCopilotPath" placeholder="e.g. C:\Users\you\AppData\Roaming\npm\copilot.cmd" autocomplete="off" spellcheck="false">
+          <button id="aicCopilotBrowse" type="button">Browse…</button>
+        </div>
+        <div class="aic-settings-row">
+          <button id="aicCopilotSave" type="button" class="aic-settings-save">Save</button>
+        </div>
+        <p class="aic-settings-status" id="aicCopilotStatus"></p>
+      </section>
+
+      <section class="aic-settings-section">
+        <button id="aicExportSettings" type="button" class="aic-export-btn">Re-export launcher script</button>
+      </section>
+    </div>
+  </div>
+</aside>
+
+<script type="text/plain" id="aicBridgeSrc">___BRIDGE_SOURCE___</script>
+
+<script>
+(function () {
+  'use strict';
+
+  var CONFIG = window.AI_COMPANION_CONFIG || {};
+  var LABEL = CONFIG.label || 'AI Companion';
+
+  var toggle = document.getElementById('aicToggle');
+  var panel = document.getElementById('aicPanel');
+  var statusEl = document.getElementById('aicStatus');
+  var logEl = document.getElementById('aicLog');
+  var emptyEl = document.getElementById('aicEmpty');
+  var form = document.getElementById('aicForm');
+  var input = document.getElementById('aicInput');
+  var sendBtn = document.getElementById('aicSend');
+  var resetBtn = document.getElementById('aicReset');
+  var closeBtn = document.getElementById('aicClose');
+  var expandBtn = document.getElementById('aicExpandBtn');
+  var settingsBtn = document.getElementById('aicSettingsBtn');
+  var viewChat = document.getElementById('aicViewChat');
+  var viewSettings = document.getElementById('aicViewSettings');
+  var settingsBack = document.getElementById('aicSettingsBack');
+  var connKV = document.getElementById('aicConnKV');
+  var repoInput = document.getElementById('aicRepoPath');
+  var repoBrowse = document.getElementById('aicRepoBrowse');
+  var repoSave = document.getElementById('aicRepoSave');
+  var repoStatus = document.getElementById('aicRepoStatus');
+  var copilotCandidatesEl = document.getElementById('aicCopilotCandidates');
+  var copilotInput = document.getElementById('aicCopilotPath');
+  var copilotBrowse = document.getElementById('aicCopilotBrowse');
+  var copilotSave = document.getElementById('aicCopilotSave');
+  var copilotStatus = document.getElementById('aicCopilotStatus');
+  var contextChip = document.getElementById('aicContextChip');
+  var contextChipLabel = document.getElementById('aicContextChipLabel');
+  var contextChipToggle = document.getElementById('aicContextChipToggle');
+  var exportBtns = [document.getElementById('aicExportEmpty'), document.getElementById('aicExportSettings')];
+  var copyCmdBtn = document.getElementById('aicCopyCmd');
+
+  document.getElementById('aicToggleLabel').textContent = LABEL;
+  document.getElementById('aicHeadLabel').textContent = LABEL;
+
+  var bridgeOK = false;
+  var busy = false;
+  var lastHealth = {};
+  var includeContext = true;
+  var currentAbort = null;
+
+  // ---- current context ---------------------------------------------------
+  // Default: the whole page (title + visible text). Pages with a notion of
+  // "current section" (tabs, slides, wizard steps) can override this --
+  // see reference/context-provider.md for the contract and a worked example.
+
+  function truncate(text) {
+    text = (text || '').replace(/\s+/g, ' ').trim();
+    return text.length > 4000 ? text.slice(0, 4000) + ' …(truncated)' : text;
+  }
+
+  function defaultContext() {
+    return { title: document.title || '', text: truncate(document.body ? document.body.innerText : ''), index: null, count: null };
+  }
+
+  function getCurrentContext() {
+    if (typeof window.AI_COMPANION_CONTEXT === 'function') {
+      try {
+        var c = window.AI_COMPANION_CONTEXT();
+        if (c && typeof c === 'object') {
+          return {
+            title: c.title || '',
+            text: truncate(c.text || ''),
+            index: c.index != null ? c.index : null,
+            count: c.count != null ? c.count : null
+          };
+        }
+      } catch (e) { /* fall through to default */ }
+    }
+    return defaultContext();
+  }
+
+  var lastChipTitle = null;
+  function refreshContextChip() {
+    if (panel.classList.contains('is-open') === false) return;
+    var ctx = getCurrentContext();
+    if (!ctx.title) { contextChip.hidden = true; return; }
+    contextChip.hidden = false;
+    contextChip.classList.toggle('is-excluded', !includeContext);
+    if (ctx.title !== lastChipTitle) {
+      lastChipTitle = ctx.title;
+    }
+    contextChipLabel.textContent = 'Context: ' + ctx.title;
+  }
+  setInterval(refreshContextChip, 1000);
+
+  contextChipToggle.addEventListener('click', function () {
+    includeContext = !includeContext;
+    contextChip.classList.toggle('is-excluded', !includeContext);
+    contextChipToggle.textContent = includeContext ? '\u00d7' : '+';
+  });
+
+  // ---- connection status --------------------------------------------------
+
+  function renderConnKV() {
+    var rows = [
+      ['Backend', lastHealth.backend || '\u2014'],
+      ['Path', lastHealth.backend_path || '\u2014'],
+      ['Repo', lastHealth.repo || '\u2014'],
+      ['Session', lastHealth.session_id ? lastHealth.session_id.slice(0, 8) + '\u2026' : '(new)'],
+      ['Turns', String(lastHealth.turns || 0)],
+      ['Bridge version', lastHealth.version || '\u2014']
+    ];
+    connKV.innerHTML = rows.map(function (r) {
+      return '<dt>' + r[0] + '</dt><dd></dd>';
+    }).join('');
+    var dds = connKV.querySelectorAll('dd');
+    rows.forEach(function (r, i) { dds[i].textContent = r[1]; });
+  }
+
+  function setStatus(connected, info) {
+    bridgeOK = connected;
+    lastHealth = info || {};
+    toggle.classList.toggle('is-connected', connected);
+    if (connected) {
+      var where = info.backend_path ? info.backend + ' (' + info.backend_path + ')' : (info.backend || '?');
+      statusEl.textContent = 'Connected: ' + where + ' \u00b7 ' + (info.repo || '');
+    } else {
+      statusEl.textContent = 'Not connected to a local AI session';
+    }
+    emptyEl.hidden = connected;
+    sendBtn.disabled = !connected || busy;
+    if (!repoInput.value && info.repo) repoInput.value = info.repo;
+    if (viewSettings.hidden === false) renderConnKV();
+  }
+
+  function checkHealth() {
+    fetch('/api/health', { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { setStatus(!!(d && d.ok), d || {}); })
+      .catch(function () { setStatus(false, {}); });
+  }
+  checkHealth();
+  setInterval(checkHealth, 4000);
+
+  // ---- chat log -------------------------------------------------------
+
+  function addTurn(question, contextTitle, pending) {
+    var turn = document.createElement('div');
+    turn.className = 'aic-turn' + (pending ? ' is-pending' : '');
+    var tag = contextTitle ? '<span class="ctx-tag"></span><br>' : '';
+    turn.innerHTML = tag + '<div class="q"></div><div class="a"></div>';
+    if (contextTitle) turn.querySelector('.ctx-tag').textContent = contextTitle;
+    turn.querySelector('.q').textContent = question;
+    turn.querySelector('.a').textContent = pending ? 'Thinking\u2026' : '';
+    logEl.appendChild(turn);
+    logEl.scrollTop = logEl.scrollHeight;
+    return turn;
+  }
+
+  function submitQuestion(q) {
+    if (!q || busy || !bridgeOK) return;
+    busy = true;
+    sendBtn.disabled = true;
+    var ctx = includeContext ? getCurrentContext() : { title: '', text: '', index: null, count: null };
+    var turn = addTurn(q, ctx.title, true);
+    var aEl = turn.querySelector('.a');
+
+    var startedAt = Date.now();
+    var ticker = setInterval(function () {
+      aEl.textContent = 'Thinking\u2026 ' + Math.round((Date.now() - startedAt) / 1000) + 's';
+    }, 1000);
+    var cancelRow = document.createElement('div');
+    cancelRow.className = 'aic-pending-row';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button'; cancelBtn.className = 'aic-cancel-btn'; cancelBtn.textContent = 'Cancel';
+    turn.insertBefore(cancelRow, aEl);
+    cancelRow.appendChild(aEl);
+    cancelRow.appendChild(cancelBtn);
+
+    var controller = ('AbortController' in window) ? new AbortController() : null;
+    currentAbort = controller;
+    cancelBtn.addEventListener('click', function () {
+      if (controller) controller.abort();
+      fetch('/api/cancel', { method: 'POST' }).catch(function () {});
+    });
+
+    fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: controller ? controller.signal : undefined,
+      body: JSON.stringify({
+        question: q,
+        context_title: ctx.title,
+        context_text: ctx.text,
+        context_index: ctx.index,
+        context_count: ctx.count
+      })
+    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        clearInterval(ticker);
+        turn.classList.remove('is-pending');
+        cancelBtn.remove();
+        if (res.d && res.d.cancelled) {
+          turn.classList.add('is-cancelled');
+          aEl.textContent = 'Cancelled.';
+          return;
+        }
+        if (!res.ok) {
+          turn.classList.add('is-error');
+          aEl.textContent = 'Error: ' + (res.d && res.d.error || 'unknown error');
+          return;
+        }
+        aEl.textContent = (res.d && res.d.result) || '(empty reply)';
+      }).catch(function (e) {
+        clearInterval(ticker);
+        turn.classList.remove('is-pending');
+        cancelBtn.remove();
+        if (e && e.name === 'AbortError') {
+          turn.classList.add('is-cancelled');
+          aEl.textContent = 'Cancelled.';
+        } else {
+          turn.classList.add('is-error');
+          aEl.textContent = 'Request failed: ' + e;
+        }
+      }).finally(function () {
+        busy = false;
+        currentAbort = null;
+        sendBtn.disabled = !bridgeOK;
+        logEl.scrollTop = logEl.scrollHeight;
+      });
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    submitQuestion(q);
+  });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  // ---- panel open/close/expand ----------------------------------------
+
+  toggle.addEventListener('click', function () {
+    var open = panel.classList.toggle('is-open');
+    panel.setAttribute('aria-hidden', String(!open));
+    if (open) { input.focus(); refreshContextChip(); }
+  });
+  closeBtn.addEventListener('click', function () {
+    panel.classList.remove('is-open');
+    panel.setAttribute('aria-hidden', 'true');
+  });
+  expandBtn.addEventListener('click', function () {
+    var on = panel.classList.toggle('is-expanded');
+    expandBtn.classList.toggle('is-on', on);
+    expandBtn.setAttribute('title', on ? 'Collapse panel' : 'Expand panel');
+  });
+  resetBtn.addEventListener('click', function () {
+    logEl.querySelectorAll('.aic-turn').forEach(function (t) { t.remove(); });
+    if (bridgeOK) fetch('/api/reset', { method: 'POST' }).catch(function () {});
+  });
+
+  // ---- settings view swap ----------------------------------------------
+
+  function showSettings() {
+    viewChat.hidden = true;
+    viewSettings.hidden = false;
+    settingsBtn.classList.add('is-on');
+    renderConnKV();
+    loadSettingsValues();
+  }
+  function showChat() {
+    viewSettings.hidden = true;
+    viewChat.hidden = false;
+    settingsBtn.classList.remove('is-on');
+  }
+  settingsBtn.addEventListener('click', function () {
+    if (viewSettings.hidden) showSettings(); else showChat();
+  });
+  settingsBack.addEventListener('click', showChat);
+
+  function loadSettingsValues() {
+    fetch('/api/settings', { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        copilotInput.value = (d.overrides && d.overrides.copilot) || '';
+        repoInput.value = d.repo || repoInput.value;
+      }).catch(function () {});
+    fetch('/api/copilot-candidates', { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var list = (d && d.candidates) || [];
+        copilotCandidatesEl.innerHTML = '';
+        if (!list.length) {
+          copilotCandidatesEl.textContent = 'No installs auto-detected.';
+          return;
+        }
+        list.forEach(function (p) {
+          var b = document.createElement('button');
+          b.type = 'button'; b.className = 'aic-candidate'; b.textContent = p; b.title = p;
+          b.addEventListener('click', function () { copilotInput.value = p; saveCopilotPath(p); });
+          copilotCandidatesEl.appendChild(b);
+        });
+      }).catch(function () {});
+  }
+
+  function browseFor(kind) {
+    return fetch('/api/browse', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kind: kind })
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { return d && d.path; })
+      .catch(function () { return null; });
+  }
+  copilotBrowse.addEventListener('click', function () {
+    copilotBrowse.disabled = true;
+    browseFor('file').then(function (p) {
+      copilotBrowse.disabled = false;
+      if (p) copilotInput.value = p;
+    });
+  });
+  repoBrowse.addEventListener('click', function () {
+    repoBrowse.disabled = true;
+    browseFor('dir').then(function (p) {
+      repoBrowse.disabled = false;
+      if (p) repoInput.value = p;
+    });
+  });
+
+  function setSettingsStatus(el, text, cls) {
+    el.textContent = text;
+    el.className = 'aic-settings-status' + (cls ? ' ' + cls : '');
+  }
+
+  function saveCopilotPath(path) {
+    setSettingsStatus(copilotStatus, 'Saving\u2026', '');
+    fetch('/api/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ copilot_path: path })
+    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) { setSettingsStatus(copilotStatus, (res.d && res.d.error) || 'Failed to save', 'is-error'); return; }
+        var backend = res.d && res.d.backend;
+        setSettingsStatus(copilotStatus,
+          backend ? ('Using backend: ' + backend + (res.d.backend_path ? ' (' + res.d.backend_path + ')' : '')) : 'Saved, but no CLI could be found.',
+          backend ? 'is-ok' : 'is-error');
+        checkHealth();
+      }).catch(function (e) { setSettingsStatus(copilotStatus, 'Request failed: ' + e, 'is-error'); });
+  }
+  copilotSave.addEventListener('click', function () { saveCopilotPath(copilotInput.value.trim()); });
+
+  repoSave.addEventListener('click', function () {
+    var path = repoInput.value.trim();
+    if (!path) { setSettingsStatus(repoStatus, 'Enter a path first.', 'is-error'); return; }
+    if (lastHealth.repo && path !== lastHealth.repo &&
+        !window.confirm('Changing the codebase path starts a new conversation. Continue?')) return;
+    setSettingsStatus(repoStatus, 'Saving\u2026', '');
+    fetch('/api/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ repo_path: path })
+    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) { setSettingsStatus(repoStatus, (res.d && res.d.error) || 'Failed to save', 'is-error'); return; }
+        setSettingsStatus(repoStatus, res.d.repo_changed ? 'Saved. New conversation started.' : 'Saved.', 'is-ok');
+        if (res.d.repo_changed) logEl.querySelectorAll('.aic-turn').forEach(function (t) { t.remove(); });
+        checkHealth();
+      }).catch(function (e) { setSettingsStatus(repoStatus, 'Request failed: ' + e, 'is-error'); });
+  });
+
+  // ---- export / copy ----------------------------------------------------
+
+  function exportScript() {
+    var src = document.getElementById('aicBridgeSrc').textContent;
+    var blob = new Blob([src], { type: 'text/x-python' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = 'ai_companion_server.py';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+  exportBtns.forEach(function (b) { if (b) b.addEventListener('click', exportScript); });
+
+  copyCmdBtn.addEventListener('click', function () {
+    var text = document.getElementById('aicCmd').textContent;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        copyCmdBtn.textContent = 'Copied';
+        setTimeout(function () { copyCmdBtn.textContent = 'Copy'; }, 1500);
+      }).catch(function () {});
+    }
+  });
+
+  // Pick up any turns already logged server-side (page refresh mid-session).
+  fetch('/api/history').then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (h) {
+      if (!h || !h.log) return;
+      h.log.forEach(function (turn) {
+        var el = addTurn(turn.q, turn.context, false);
+        el.querySelector('.a').textContent = turn.a;
+      });
+    }).catch(function () {});
+})();
+</script>

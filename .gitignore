@@ -5,3 +5,8 @@ __pycache__/
 # build output: decks are rebuilt from their shell + slide files
 deck.html
 out.png
+
+# build output: rebuilt from ai-companion.html + ai_companion_server.py
+ai-companion.fragment.html
+.ai-companion-session.json
+.ai-companion-config.json
