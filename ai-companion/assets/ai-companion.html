@@ -106,7 +106,7 @@
     gap: 12px;
   }
   .aic-turn .q { color: var(--chrome-muted, #8b9bb4); font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
-  .aic-turn .a { color: var(--prose, #cbd6e6); white-space: pre-wrap; }
+  .aic-turn .a { color: var(--prose, #cbd6e6); white-space: pre-wrap; } /* plain-text states: pending/error/cancelled -- pre-wrap keeps multi-line stderr dumps readable */
   .aic-turn .ctx-tag {
     display: inline-block; font-size: 10px; color: var(--chrome-muted, #8b9bb4);
     border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); border-radius: 5px; padding: 1px 5px; margin-bottom: 4px;
@@ -114,12 +114,41 @@
   .aic-turn.is-pending .a { color: var(--chrome-muted, #8b9bb4); font-style: italic; }
   .aic-turn.is-error .a { color: #ef4444; }
   .aic-turn.is-cancelled .a { color: var(--chrome-muted, #8b9bb4); }
+
+  /* Rendered-markdown state: real block elements now carry the line
+     breaks/spacing, so pre-wrap would double them up -- turn it off. */
+  .aic-turn .a.is-rich { white-space: normal; }
+  .aic-turn .a.is-rich > *:first-child { margin-top: 0; }
+  .aic-turn .a.is-rich > *:last-child { margin-bottom: 0; }
+  .aic-turn .a.is-rich p { margin: 0 0 8px; }
+  .aic-turn .a.is-rich ul, .aic-turn .a.is-rich ol { margin: 0 0 8px; padding-left: 20px; }
+  .aic-turn .a.is-rich li { margin-bottom: 2px; }
+  .aic-turn .a.is-rich h3, .aic-turn .a.is-rich h4, .aic-turn .a.is-rich h5, .aic-turn .a.is-rich h6 {
+    margin: 10px 0 4px; font-size: 1em; color: var(--chrome-ink, #e8eef7);
+  }
+  .aic-turn .a.is-rich code {
+    background: var(--card-bg, rgba(255, 255, 255, 0.06)); border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    border-radius: 4px; padding: 0 4px; font: 12px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+  .aic-turn .a.is-rich pre {
+    background: var(--card-bg, rgba(255, 255, 255, 0.06)); border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14));
+    border-radius: 8px; padding: 8px 10px; overflow-x: auto; margin: 6px 0;
+  }
+  .aic-turn .a.is-rich pre code { background: none; border: none; padding: 0; }
+  .aic-turn .a.is-rich a { color: var(--arc-consumption, #1677c8); }
+  .aic-turn .a.is-rich strong { font-weight: 700; color: var(--chrome-ink, #e8eef7); }
   .aic-pending-row { display: flex; align-items: center; gap: 8px; }
   .aic-cancel-btn {
     border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: transparent; color: var(--chrome-muted, #8b9bb4);
     border-radius: 6px; padding: 1px 7px; font: 500 10.5px/1.6 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); cursor: pointer; flex: none;
   }
   .aic-cancel-btn:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); color: var(--chrome-ink, #e8eef7); }
+  .aic-copy-btn {
+    display: block; margin-top: 6px;
+    border: 1px solid var(--chrome-line, rgba(255, 255, 255, 0.14)); background: transparent; color: var(--chrome-muted, #8b9bb4);
+    border-radius: 6px; padding: 1px 7px; font: 500 10.5px/1.6 var(--ui, -apple-system, "Segoe UI", Arial, sans-serif); cursor: pointer;
+  }
+  .aic-copy-btn:hover { background: var(--chrome-hover, rgba(255, 255, 255, 0.09)); color: var(--chrome-ink, #e8eef7); }
 
   .aic-empty { padding: 4px 2px 12px; }
   .aic-empty p { margin: 0 0 8px; }
@@ -220,6 +249,11 @@
   .aic-settings-row button.aic-settings-save {
     background: var(--arc-consumption, #1677c8); border-color: var(--arc-consumption, #1677c8); color: #fff;
   }
+
+  .aic-sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
 </style>
 
 <button class="aic-toggle" id="aicToggle" type="button">
@@ -241,7 +275,7 @@
   </header>
 
   <div class="aic-view aic-view-chat" id="aicViewChat">
-    <div class="aic-log" id="aicLog">
+    <div class="aic-log" id="aicLog" role="log">
       <div class="aic-empty" id="aicEmpty" hidden>
         <p><strong>Not connected to a local AI session.</strong></p>
         <ol>
@@ -258,6 +292,7 @@
         <button id="aicExportEmpty" type="button" class="aic-export-btn">Export script</button>
       </div>
     </div>
+    <div class="aic-sr-only" id="aicSrStatus" aria-live="polite"></div>
     <div class="aic-context-chip" id="aicContextChip" hidden>
       <span id="aicContextChipLabel"></span>
       <button id="aicContextChipToggle" type="button" title="Exclude the current context from questions">&times;</button>
@@ -317,6 +352,90 @@
 (function () {
   'use strict';
 
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Deliberately basic, dependency-free markdown -> safe HTML. Escapes
+  // everything first so raw HTML/script in a model's answer can never
+  // inject; only fixed tags this function itself emits ever reach
+  // innerHTML. Skips underscore-emphasis on purpose -- AI answers are full
+  // of snake_case identifiers, and treating get_current_context as
+  // get<em>current</em>context is worse than not supporting _italic_ at all.
+  function mdToHtml(src) {
+    var text = escapeHtml(src == null ? '' : src);
+
+    var blocks = [];
+    text = text.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, function (_, code) {
+      blocks.push(code.replace(/\n$/, ''));
+      return ' B' + (blocks.length - 1) + ' ';
+    });
+
+    var spans = [];
+    text = text.replace(/`([^`\n]+)`/g, function (_, code) {
+      spans.push(code);
+      return ' S' + (spans.length - 1) + ' ';
+    });
+
+    function inline(s) {
+      s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+      s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      return s;
+    }
+
+    var isBlockToken = function (line) { return /^ B\d+ $/.test(line.trim()); };
+
+    var lines = text.split('\n');
+    var out = [];
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (line.trim() === '') { i++; continue; }
+      if (isBlockToken(line)) { out.push(line.trim()); i++; continue; }
+
+      var h = line.match(/^(#{1,6})\s+(.*)$/);
+      if (h) {
+        var lvl = Math.min(h[1].length + 2, 6); // keep headers modest inside a small chat bubble
+        out.push('<h' + lvl + '>' + inline(h[2]) + '</h' + lvl + '>');
+        i++; continue;
+      }
+      if (/^\s*[-*]\s+/.test(line)) {
+        var items = [];
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          items.push('<li>' + inline(lines[i].replace(/^\s*[-*]\s+/, '')) + '</li>');
+          i++;
+        }
+        out.push('<ul>' + items.join('') + '</ul>');
+        continue;
+      }
+      if (/^\s*\d+[.)]\s+/.test(line)) {
+        var oitems = [];
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+          oitems.push('<li>' + inline(lines[i].replace(/^\s*\d+[.)]\s+/, '')) + '</li>');
+          i++;
+        }
+        out.push('<ol>' + oitems.join('') + '</ol>');
+        continue;
+      }
+      var para = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() !== '' &&
+             !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) &&
+             !/^#{1,6}\s+/.test(lines[i]) && !isBlockToken(lines[i])) {
+        para.push(lines[i]); i++;
+      }
+      out.push('<p>' + inline(para.join('<br>')) + '</p>');
+    }
+
+    var html = out.join('');
+    html = html.replace(/ B(\d+) /g, function (_, n) { return '<pre><code>' + blocks[+n] + '</code></pre>'; });
+    html = html.replace(/ S(\d+) /g, function (_, n) { return '<code>' + spans[+n] + '</code>'; });
+    return html;
+  }
+
   var CONFIG = window.AI_COMPANION_CONFIG || {};
   var LABEL = CONFIG.label || 'AI Companion';
 
@@ -350,6 +469,7 @@
   var contextChipToggle = document.getElementById('aicContextChipToggle');
   var exportBtns = [document.getElementById('aicExportEmpty'), document.getElementById('aicExportSettings')];
   var copyCmdBtn = document.getElementById('aicCopyCmd');
+  var srStatus = document.getElementById('aicSrStatus');
 
   document.getElementById('aicToggleLabel').textContent = LABEL;
   document.getElementById('aicHeadLabel').textContent = LABEL;
@@ -468,6 +588,25 @@
     return turn;
   }
 
+  // Renders a finished answer as markdown and appends a copy-raw-text
+  // button. Shared by live answers and history restored after a refresh,
+  // so both look identical.
+  function renderAnswer(turn, aEl, text) {
+    aEl.classList.add('is-rich');
+    aEl.innerHTML = mdToHtml(text);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      var btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'aic-copy-btn'; btn.textContent = 'Copy';
+      btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(text).then(function () {
+          btn.textContent = 'Copied';
+          setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+        }).catch(function () {});
+      });
+      turn.appendChild(btn);
+    }
+  }
+
   function submitQuestion(q) {
     if (!q || busy || !bridgeOK) return;
     busy = true;
@@ -514,14 +653,17 @@
         if (res.d && res.d.cancelled) {
           turn.classList.add('is-cancelled');
           aEl.textContent = 'Cancelled.';
+          srStatus.textContent = 'Cancelled.';
           return;
         }
         if (!res.ok) {
           turn.classList.add('is-error');
           aEl.textContent = 'Error: ' + (res.d && res.d.error || 'unknown error');
+          srStatus.textContent = 'Error: ' + (res.d && res.d.error || 'unknown error');
           return;
         }
-        aEl.textContent = (res.d && res.d.result) || '(empty reply)';
+        renderAnswer(turn, aEl, (res.d && res.d.result) || '(empty reply)');
+        srStatus.textContent = 'Answer ready.';
       }).catch(function (e) {
         clearInterval(ticker);
         turn.classList.remove('is-pending');
@@ -529,9 +671,11 @@
         if (e && e.name === 'AbortError') {
           turn.classList.add('is-cancelled');
           aEl.textContent = 'Cancelled.';
+          srStatus.textContent = 'Cancelled.';
         } else {
           turn.classList.add('is-error');
           aEl.textContent = 'Request failed: ' + e;
+          srStatus.textContent = 'Request failed.';
         }
       }).finally(function () {
         busy = false;
@@ -546,22 +690,43 @@
     var q = input.value.trim();
     if (!q) return;
     input.value = '';
+    if (inputBaseHeight !== null) input.style.height = inputBaseHeight + 'px';
     submitQuestion(q);
   });
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
   });
+  // Auto-grow the textarea with content instead of scrolling a fixed 2-row box.
+  var inputBaseHeight = null;
+  input.addEventListener('input', function () {
+    if (inputBaseHeight === null) inputBaseHeight = input.clientHeight;
+    input.style.height = 'auto';
+    input.style.height = Math.max(inputBaseHeight, Math.min(input.scrollHeight, 160)) + 'px';
+  });
 
   // ---- panel open/close/expand ----------------------------------------
 
-  toggle.addEventListener('click', function () {
-    var open = panel.classList.toggle('is-open');
-    panel.setAttribute('aria-hidden', String(!open));
-    if (open) { input.focus(); refreshContextChip(); }
-  });
-  closeBtn.addEventListener('click', function () {
+  function openPanel() {
+    panel.classList.add('is-open');
+    panel.setAttribute('aria-hidden', 'false');
+    input.focus();
+    refreshContextChip();
+  }
+  function closePanel() {
     panel.classList.remove('is-open');
     panel.setAttribute('aria-hidden', 'true');
+    toggle.focus();
+  }
+  toggle.addEventListener('click', function () {
+    if (panel.classList.contains('is-open')) closePanel(); else openPanel();
+  });
+  closeBtn.addEventListener('click', closePanel);
+  // Escape closes the panel, but only when focus is actually inside it --
+  // never steal Escape from the host page's own handling elsewhere.
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && panel.classList.contains('is-open') && panel.contains(document.activeElement)) {
+      closePanel();
+    }
   });
   expandBtn.addEventListener('click', function () {
     var on = panel.classList.toggle('is-expanded');
@@ -705,7 +870,7 @@
       if (!h || !h.log) return;
       h.log.forEach(function (turn) {
         var el = addTurn(turn.q, turn.context, false);
-        el.querySelector('.a').textContent = turn.a;
+        renderAnswer(el, el.querySelector('.a'), turn.a);
       });
     }).catch(function () {});
 })();
