@@ -1,0 +1,7 @@
+# Sensitive-term deny list for `skills_repo.py gate`.
+# One term per line, matched case-insensitively against file contents and paths.
+# Prefix a line with `re:` for a regular expression.
+# Copy to .sensitive-terms.txt (gitignored) and add your own entries, e.g.
+#   an employer name, an internal hostname fragment, a ticket-key pattern:
+#   re:[A-Z]{2,5}-\d{3,6}
+# This example intentionally contains no active entries.

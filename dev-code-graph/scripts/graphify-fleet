@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Launcher: runs graphify_fleet.py under the Python interpreter that owns the
+# installed `graphify` command (override with GRAPHIFY_PYTHON / GRAPHIFY_BIN).
+set -euo pipefail
+
+ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GRAPHIFY_BIN="${GRAPHIFY_BIN:-$(command -v graphify || true)}"
+
+if [[ -n "${GRAPHIFY_PYTHON:-}" && -x "${GRAPHIFY_PYTHON}" ]]; then
+    PYTHON="${GRAPHIFY_PYTHON}"
+elif [[ -n "${GRAPHIFY_BIN}" ]]; then
+    PYTHON="$(head -n 1 "${GRAPHIFY_BIN}" | sed 's/^#!//')"
+else
+    echo "graphify-fleet: graphify is not installed (set GRAPHIFY_BIN or GRAPHIFY_PYTHON)" >&2
+    exit 1
+fi
+
+if [[ ! -x "${PYTHON}" ]]; then
+    echo "graphify-fleet: cannot find graphify's Python interpreter" >&2
+    exit 1
+fi
+
+exec "${PYTHON}" "${ROOT}/scripts/graphify_fleet.py" "$@"

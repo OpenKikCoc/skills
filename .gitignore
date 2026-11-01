@@ -10,3 +10,6 @@ out.png
 ai-companion.fragment.html
 .ai-companion-session.json
 .ai-companion-config.json
+
+# local publish-gate deny list (never commit)
+.sensitive-terms.txt

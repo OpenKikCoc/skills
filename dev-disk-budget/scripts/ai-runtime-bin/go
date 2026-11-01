@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""AI-runtime-only Go launcher for dev-disk-budget."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+
+KIND = "dev-disk-budget-go-shim"
+ALLOWED_COMMANDS = {"build", "test", "vet", "generate", "list", "run", "version", "env"}
+
+
+class ShimError(Exception):
+    pass
+
+
+def is_env_mutation_flag(value: str) -> bool:
+    return value in {"-w", "--w", "-u", "--u"} or value.startswith(
+        ("-w=", "--w=", "-u=", "--u=")
+    )
+
+
+def real_go() -> Path:
+    raw = os.environ.get("DEV_DISK_BUDGET_REAL_GO", "")
+    candidate = Path(raw).expanduser()
+    if not raw or not candidate.is_absolute():
+        raise ShimError("DEV_DISK_BUDGET_REAL_GO must name an absolute executable")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ShimError(f"real Go executable is unavailable: {error}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ShimError("DEV_DISK_BUDGET_REAL_GO must name an executable file")
+    if os.path.samefile(resolved, Path(__file__).resolve()):
+        raise ShimError("real Go executable resolves to the shim")
+    return resolved
+
+
+def invocation(arguments: list[str]) -> tuple[Path, list[str]]:
+    cwd = Path.cwd()
+    remaining = list(arguments)
+    if remaining[:1] == ["-C"]:
+        if len(remaining) < 3:
+            raise ShimError("go -C requires a directory and subcommand")
+        cwd = Path(remaining[1]).expanduser()
+        remaining = remaining[2:]
+    elif remaining[:1] and remaining[0].startswith("-C="):
+        if not remaining[0][3:]:
+            raise ShimError("go -C requires a directory and subcommand")
+        cwd = Path(remaining[0][3:]).expanduser()
+        remaining = remaining[1:]
+    if not remaining or remaining[0] not in ALLOWED_COMMANDS:
+        raise ShimError("supported Go commands: build, test, vet, generate, list, run, version, env")
+    if remaining[0] == "env" and any(is_env_mutation_flag(value) for value in remaining[1:]):
+        raise ShimError("go env mutation is not supported")
+    try:
+        resolved_cwd = cwd.resolve(strict=True)
+    except OSError as error:
+        raise ShimError(f"Go working directory is unavailable: {error}") from error
+    if not resolved_cwd.is_dir():
+        raise ShimError("Go working directory must be a directory")
+    return resolved_cwd, remaining
+
+
+def main() -> int:
+    try:
+        executable = real_go()
+        cwd, command = invocation(sys.argv[1:])
+        if os.environ.get("GOCACHEPROG"):
+            raise ShimError("external GOCACHEPROG is outside the configured disk budget")
+        if command[0] in {"version", "env"}:
+            raw_go_flags = os.environ.get("GOFLAGS", "")
+            try:
+                inherited_go_flags = shlex.split(raw_go_flags)
+            except ValueError as error:
+                raise ShimError(f"invalid GOFLAGS: {error}") from error
+            if command[0] == "env" and any(is_env_mutation_flag(value) for value in inherited_go_flags):
+                raise ShimError("go env mutation through GOFLAGS is not supported")
+            direct_env = dict(os.environ, GOFLAGS=raw_go_flags, GOTOOLCHAIN="local")
+            os.chdir(cwd)
+            os.execve(str(executable), [str(executable), *command], direct_env)
+            raise AssertionError("execve returned")
+        if os.environ.get("DEV_DISK_BUDGET_ACTIVE_RUN"):
+            os.chdir(cwd)
+            os.execve(str(executable), [str(executable), *command], dict(os.environ))
+            raise AssertionError("execve returned")
+        runner = Path(__file__).resolve().parents[1] / "guarded_go.py"
+        if not runner.is_file():
+            raise ShimError("guarded Go runner is unavailable beside the shim")
+        arguments = [
+            sys.executable, str(runner), "run", "--cwd", str(cwd),
+            "--go-binary", str(executable),
+        ]
+        session_id = os.environ.get("DEV_DISK_BUDGET_SESSION_ID")
+        expected_growth = os.environ.get("DEV_DISK_BUDGET_EXPECTED_GROWTH_BYTES")
+        if session_id:
+            arguments.extend(["--session-id", session_id])
+        if expected_growth:
+            try:
+                if int(expected_growth) <= 0:
+                    raise ValueError
+            except ValueError as error:
+                raise ShimError("DEV_DISK_BUDGET_EXPECTED_GROWTH_BYTES must be a positive integer") from error
+            arguments.extend(["--expected-growth-bytes", expected_growth])
+        arguments.extend(["--", *command])
+        os.execve(sys.executable, arguments, dict(os.environ))
+        raise AssertionError("execve returned")
+    except (OSError, ShimError) as error:
+        print(json.dumps({"kind": KIND + "-error", "error": str(error)}), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

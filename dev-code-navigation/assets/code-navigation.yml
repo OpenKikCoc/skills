@@ -1,0 +1,23 @@
+description: Read-only code navigation for coding agents with independent worktrees
+single_project: false
+prompt: |
+  Prefer symbol tools for definitions, callers/references, implementations and targeted bodies before grep-based navigation or broad file reads.
+  After activation or a ready status, complete the task-relevant symbol query; status alone is not code navigation.
+  Use ordinary search for unknown names or paths, text, config, documentation, generated/vendor code and historical revisions outside the active tree.
+  If a required tool or language server is unavailable or a query fails, state the observed reason once and use bounded text search; do not auto-reconnect or restart servers.
+  Use the host agent's existing tools for edits, shell commands, plain text and tiny known-file fixes.
+  Bind the active project to the actual working tree, not its shared Git directory.
+  After entering or creating another worktree, activate its absolute root before querying.
+  Do not activate a home directory or a directory containing unrelated repositories.
+  Stable repositories below the configured workspace roots are registered for activation, but only the active project runs language servers.
+  No onboarding, memory generation, full-repository reading or fleet-wide advance indexing is required.
+fixed_tools:
+  - activate_project
+  - get_current_config
+  - get_symbols_overview
+  - find_symbol
+  - find_referencing_symbols
+  - find_implementations
+  - find_declaration
+  - restart_language_server
+tool_description_overrides: {}

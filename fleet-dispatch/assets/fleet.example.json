@@ -1,0 +1,60 @@
+{
+  "fleet_home": "~/.agent-fleet",
+  "coordinator": {
+    "runtime": "claude",
+    "effort": "high",
+    "card": "~/.agent-fleet/cards/COORDINATOR.md"
+  },
+  "routing": {
+    "thresholds": {"medium": 2, "high": 4, "xhigh": 7},
+    "reviewer_min": "medium",
+    "reviewer_min_when_risky": "high"
+  },
+  "limits": {
+    "max_active": 4,
+    "max_active_per_repo": 2,
+    "steers_per_window": 2,
+    "steer_window_minutes": 30,
+    "stale_fraction_of_timebox": 0.5,
+    "supervisor_offline_after_minutes": 120
+  },
+  "notify": {
+    "argv": ["sh", "-c", "cat >> ~/.agent-fleet/notifications.log"]
+  },
+  "runtimes": {
+    "codex": {
+      "start": ["codex", "exec", "--json", "-C", "{cwd}", "--sandbox", "workspace-write",
+                "-m", "{model}", "-c", "model_reasoning_effort=\"{effort}\"", "-"],
+      "resume": ["codex", "exec", "resume", "--json",
+                 "-c", "model_reasoning_effort=\"{effort}\"", "{session_id}", "-"],
+      "stdin": "{prompt_file}",
+      "session_id_mode": "capture",
+      "session_id_regex": "\"thread_id\"\\s*:\\s*\"([0-9a-f-]{36})\"",
+      "default_model": "<codex model>",
+      "tiers": {
+        "low": {"effort": "low"},
+        "medium": {"effort": "medium"},
+        "high": {"effort": "high"},
+        "xhigh": {"effort": "xhigh"}
+      }
+    },
+    "claude": {
+      "start": ["claude", "-p", "--session-id", "{session_id}", "--model", "{model}",
+                "--effort", "{effort}", "--permission-mode", "acceptEdits",
+                "--output-format", "stream-json", "--verbose"],
+      "resume": ["claude", "-p", "--resume", "{session_id}", "--effort", "{effort}",
+                 "--permission-mode", "acceptEdits",
+                 "--output-format", "stream-json", "--verbose"],
+      "stdin": "{prompt_file}",
+      "session_id_mode": "assign",
+      "default_model": "<claude model>",
+      "tiers": {
+        "low": {"effort": "low", "model": "<fast claude model>"},
+        "medium": {"effort": "medium"},
+        "high": {"effort": "high"},
+        "xhigh": {"effort": "xhigh"},
+        "max": {"effort": "max"}
+      }
+    }
+  }
+}

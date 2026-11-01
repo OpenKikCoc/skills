@@ -1,0 +1,15 @@
+{
+  "language_backend": "LSP",
+  "gui_log_window": false,
+  "web_dashboard": false,
+  "web_dashboard_open_on_launch": false,
+  "trace_lsp_communication": false,
+  "log_level": 30,
+  "base_modes": [],
+  "default_modes": ["no-memories"],
+  "default_max_tool_answer_chars": 16000,
+  "symbol_info_budget": 5,
+  "tool_timeout": 120,
+  "trusted_project_path_patterns": [],
+  "projects": []
+}
