@@ -92,6 +92,16 @@ python3 scripts/pod_startup_classify.py --second now.json --format json
 
 Test: `python3 -I scripts/test_pod_startup_classify.py`.
 
+`scripts/owner_chain.py` builds Pod -> owner chains from collected
+`kubectl get ... -o json` files and flags dangling owners, UID mismatches and
+cycles (exit 1 on findings):
+
+```bash
+python3 scripts/owner_chain.py pods.json rs.json deploy.json --pod <name>
+```
+
+Test: `python3 -I scripts/test_owner_chain.py`.
+
 ## References
 
 - [pod-startup-audit.md](references/pod-startup-audit.md) - snapshots, event
@@ -100,3 +110,9 @@ Test: `python3 -I scripts/test_pod_startup_classify.py`.
   graph, evidence labels, version verification.
 - [rca-deliverable.md](references/rca-deliverable.md) - report structure and
   state vocabulary.
+- [control-plane-diagnosis.md](references/control-plane-diagnosis.md) - Lease
+  leader lookup, all-replica logs, restart forensics, "why unschedulable".
+- [change-attribution.md](references/change-attribution.md) - rollout, GitOps,
+  Helm, managedFields and audit history; nearby versus caused.
+- [workload-identity.md](references/workload-identity.md) - URL/ID/name to a
+  verified identity packet (owner chain, UID, cluster); refuse if ambiguous.

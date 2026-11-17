@@ -47,7 +47,7 @@ holds depth, `scripts/` holds standard-library tools with their own `test_*.py`.
 
 | Skill | What it does |
 |---|---|
-| [ops-k8s-rca](ops-k8s-rca/SKILL.md) | Evidence-driven Kubernetes incident RCA with plain kubectl; pod-startup classifier |
+| [ops-k8s-rca](ops-k8s-rca/SKILL.md) | Evidence-driven Kubernetes incident RCA with plain kubectl: pod-startup classifier, control-plane diagnosis, change attribution, workload identity |
 | [ops-oncall-ledger](ops-oncall-ledger/SKILL.md) | Oncall tickets as a local JSON ledger with per-ticket RCA and an idempotent weekly roll-up |
 
 ## web — HTML deliverables
@@ -56,6 +56,8 @@ holds depth, `scripts/` holds standard-library tools with their own `test_*.py`.
 |---|---|
 | [web-live-deck](web-live-deck/SKILL.md) | Author presentation decks as HTML |
 | [web-ai-companion](web-ai-companion/SKILL.md) | Embed a local-AI Q&A panel in any HTML page |
+| [web-diagram](web-diagram/SKILL.md) | Architecture, flow, and sequence diagrams as HTML cards with auto-routed SVG connectors; verifier checks overlaps and edge crossings, then renders headless |
+| [web-html-box](web-html-box/SKILL.md) | Self-contained interactive HTML block at a fixed viewport for docs and pages; exact-viewport overflow check and hash-verified publish |
 
 ## hr — hiring
 

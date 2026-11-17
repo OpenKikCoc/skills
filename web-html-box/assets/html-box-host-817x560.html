@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=817, initial-scale=1">
+  <title>Host-aware HTML Box</title>
+  <style>
+    :root {
+      --ink: #24312e;
+      --muted: #687672;
+      --line: #d4ddda;
+      --canvas: #f6f8f7;
+      --surface: #ffffff;
+      --accent: #4f7fa4;
+      --danger: #a65d5d;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 817px;
+      height: 560px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    main {
+      width: 817px;
+      height: 560px;
+      padding: 18px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+    }
+    h1, p { margin: 0; }
+    h1 { font-size: 20px; line-height: 28px; }
+    .subtitle, .status { color: var(--muted); font-size: 12px; line-height: 18px; }
+    .panel {
+      min-height: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 14px;
+    }
+    button {
+      width: fit-content;
+      min-height: 36px;
+      padding: 8px 14px;
+      border: 0;
+      border-radius: 7px;
+      background: var(--accent);
+      color: #ffffff;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:disabled { cursor: wait; opacity: 0.58; }
+    .result {
+      min-height: 0;
+      padding: 14px;
+      border-radius: 8px;
+      background: #eef3f6;
+      overflow-wrap: anywhere;
+      font-size: 14px;
+      line-height: 22px;
+    }
+    .error { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Host-aware HTML Box</h1>
+      <p class="subtitle">Uses an optional host bridge and works without it.</p>
+    </header>
+    <section class="panel">
+      <p id="status" class="status" role="status">Ready.</p>
+      <button id="load" type="button">Load page context</button>
+      <div id="result" class="result">No host data loaded. The box is fully usable without it.</div>
+    </section>
+  </main>
+  <script>
+    // Optional bridge contract (illustrative): window.htmlBoxHost.getContext()
+    // returns a Promise of a plain object such as { title: "..." }.
+    const statusNode = document.getElementById("status");
+    const resultNode = document.getElementById("result");
+    const loadButton = document.getElementById("load");
+
+    function renderError(message) {
+      statusNode.textContent = "Unavailable";
+      resultNode.classList.add("error");
+      resultNode.textContent = message;
+    }
+
+    async function loadContext() {
+      resultNode.classList.remove("error");
+      loadButton.disabled = true;
+      statusNode.textContent = "Loading...";
+      try {
+        const host = window.htmlBoxHost;
+        if (!host || typeof host.getContext !== "function") {
+          renderError("No host bridge here; showing the standalone view only.");
+          return;
+        }
+        const context = await host.getContext();
+        statusNode.textContent = "Loaded";
+        resultNode.textContent = "Viewing: " + ((context && context.title) || "this page");
+      } catch (error) {
+        renderError((error && error.message) || "Unable to load host context.");
+      } finally {
+        loadButton.disabled = false;
+      }
+    }
+
+    loadButton.addEventListener("click", loadContext);
+  </script>
+</body>
+</html>

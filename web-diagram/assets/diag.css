@@ -1,0 +1,47 @@
+/* web-diagram stylesheet. Light stage, independent of the page theme.
+   Node kinds (data-kind): primary (default) compute store control external note ok bad muted
+   Edge kinds (edges JSON "kind"): primary data outcome feedback bulk danger tree */
+.diag-wrap{position:relative;overflow:hidden;background:#f7f9fc;background-image:linear-gradient(rgba(148,163,184,.13) 1px,transparent 1px),linear-gradient(90deg,rgba(148,163,184,.13) 1px,transparent 1px);background-size:24px 24px;border-radius:12px}
+.diag{position:relative;transform-origin:top left;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",sans-serif;color:#152238;--ink:#152238;--muted:#5b6f88;--line:#c9d6e5;--surface:#fff;--mono:"SF Mono",Menlo,Consolas,monospace}
+.diag svg.edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:1}
+.diag .edge{fill:none;stroke-width:2.4;opacity:.9}
+.diag .edge.primary{stroke:#5b5bd6}.diag .edge.data{stroke:#0f9d8a;stroke-dasharray:8 6}.diag .edge.outcome{stroke:#249c62}.diag .edge.feedback{stroke:#d97706;stroke-dasharray:8 6}.diag .edge.bulk{stroke:#94a3b8;stroke-width:5;opacity:.7}.diag .edge.danger{stroke:#dc2626}
+.diag .edge.tree{stroke:#94a3b8;stroke-width:2;opacity:.8}
+.diag .edge.thick{stroke-width:4}
+.diag .edge-label{position:absolute;z-index:3;transform:translate(-50%,-50%);padding:3px 9px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--muted);font-size:12.5px;white-space:nowrap;box-shadow:0 1px 3px rgba(15,34,56,.07);line-height:1.35}
+.diag .edge-label.feedback{border-color:rgba(217,119,6,.45);color:#9a5b00}.diag .edge-label.data{border-color:rgba(15,157,138,.45);color:#0b6f62}.diag .edge-label.outcome{border-color:rgba(36,156,98,.45);color:#1a7048}.diag .edge-label.danger{border-color:rgba(220,38,38,.45);color:#a31d1d}
+/* groups, free text, lanes */
+.diag .grp{position:absolute;border:1.5px solid var(--line);border-radius:16px;background:rgba(255,255,255,.62);z-index:0}
+.diag .grp::before{content:attr(data-label);position:absolute;top:12px;left:18px;font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--gc,#5b6f88);white-space:nowrap}
+.diag .grp.tight::before{top:8px;left:12px}
+.diag .txt{position:absolute;z-index:2;color:var(--muted);font-size:12.5px;line-height:1.45}
+.diag .txt b{color:var(--ink)}
+.diag .lane{position:absolute;z-index:0;border-left:2px dashed var(--line)}
+/* nodes: --accent is set per data-kind */
+.diag .node{--accent:#5b5bd6;position:absolute;z-index:2;box-sizing:border-box;padding:28px 13px 11px;border:1.5px solid color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:12px;background:color-mix(in srgb,var(--accent) 6%,var(--surface));box-shadow:0 2px 8px rgba(15,34,56,.07)}
+.diag .node::before{content:attr(data-type);position:absolute;top:9px;left:13px;color:var(--accent);font-size:11.5px;font-weight:800;letter-spacing:.10em;white-space:nowrap}
+.diag .node.notype{padding-top:11px}.diag .node.notype::before{display:none}
+.diag .node h4{margin:0 0 4px;color:var(--accent);font-size:15px;line-height:1.25;font-weight:700}
+.diag .node p{margin:0;color:var(--muted);font-size:12.5px;line-height:1.42}
+.diag .node p+p{margin-top:3px}
+.diag .node code{font-family:var(--mono);font-size:12px;color:var(--ink);background:none;padding:0}
+.diag .node b{color:var(--ink)}
+.diag .node.center{text-align:center;display:flex;flex-direction:column;justify-content:center}
+.diag .node[data-kind="primary"]{--accent:#5b5bd6}.diag .node[data-kind="compute"]{--accent:#1677c8}.diag .node[data-kind="store"]{--accent:#7b52b9}.diag .node[data-kind="control"]{--accent:#c2410c}.diag .node[data-kind="external"]{--accent:#64748b}.diag .node[data-kind="note"]{--accent:#d97706}.diag .node[data-kind="ok"]{--accent:#249c62}.diag .node[data-kind="bad"]{--accent:#dc2626}.diag .node[data-kind="muted"]{--accent:#94a3b8}
+/* node shapes: .pill (rounded label), .plain (no type tag, compact), .state (flow state) */
+.diag .node.pill{padding:6px 12px;border-radius:999px;text-align:center;font-size:13px;font-weight:700;color:var(--accent)}
+.diag .node.plain{padding:9px 12px;font-size:13px;color:var(--ink)}
+.diag .node.plain h4{font-size:13.5px}
+.diag .node.state{padding:10px 12px;text-align:center;font-weight:800;font-size:13px;letter-spacing:.04em;color:var(--accent);border-radius:999px}
+.diag .node.state.notype{padding:10px 12px}
+/* sequence diagrams */
+.diag.seq .seq-head{position:absolute;z-index:2;box-sizing:border-box;display:flex;align-items:center;justify-content:center;text-align:center;border:1.5px solid rgba(91,91,214,.4);border-radius:10px;background:#eef0fb;color:#2f2f8f;font-size:13px;font-weight:700;line-height:1.25;padding:4px 8px}
+.diag.seq .seq-head.k-compute{border-color:rgba(22,119,200,.4);background:#e8f2fc;color:#0f4f8a}.diag.seq .seq-head.k-store{border-color:rgba(123,82,185,.4);background:#f1eafd;color:#4c1d95}.diag.seq .seq-head.k-control{border-color:rgba(194,65,12,.4);background:#fdf0e8;color:#9a3412}.diag.seq .seq-head.k-external{border-color:rgba(100,116,139,.4);background:#fff;color:#334155}.diag.seq .seq-head.k-note{border-color:rgba(217,119,6,.4);background:#fff8e6;color:#6b4300}.diag.seq .seq-head.k-ok{border-color:rgba(36,156,98,.4);background:#e8f6ee;color:#14532d}.diag.seq .seq-head.k-bad{border-color:rgba(220,38,38,.4);background:#fdecec;color:#7f1d1d}.diag.seq .seq-head.k-muted{border-color:rgba(148,163,184,.5);background:#f1f4f8;color:#334155}
+.diag.seq .lifeline{stroke:#c9d6e5;stroke-width:1.5;stroke-dasharray:4 4}
+.diag.seq .msg{fill:none;stroke-width:2}.diag.seq .msg.primary{stroke:#5b5bd6}.diag.seq .msg.data{stroke:#0f9d8a}.diag.seq .msg.danger{stroke:#dc2626}.diag.seq .msg.dashed{stroke-dasharray:6 5}
+.diag.seq .seq-label{position:absolute;z-index:3;transform:translate(-50%,-100%);padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.92);border:1px solid var(--line);color:var(--ink);font-size:12.5px;white-space:nowrap;line-height:1.35}
+.diag.seq .seq-label.reply{color:#0b6f62;border-color:rgba(15,157,138,.4)}
+.diag.seq .seq-note{position:absolute;z-index:3;box-sizing:border-box;padding:6px 10px;border:1px solid rgba(217,119,6,.5);border-radius:8px;background:#fff8e6;color:#6b4300;font-size:12.5px;line-height:1.35;text-align:center}
+.diag.seq .seq-frame{position:absolute;z-index:1;box-sizing:border-box;border:1.5px dashed rgba(91,91,214,.45);border-radius:10px}
+.diag.seq .seq-frame-tag{position:absolute;top:-1px;left:-1px;padding:2px 8px;border-radius:9px 0 9px 0;background:#5b5bd6;color:#fff;font-size:11px;font-weight:800;letter-spacing:.08em}
+.diag.seq .seq-frame-text{position:absolute;top:3px;left:52px;color:#2f2f8f;font-size:12px;font-weight:600}

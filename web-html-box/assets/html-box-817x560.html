@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=817, initial-scale=1">
+  <title>HTML Box Title</title>
+  <style>
+    :root {
+      --ink: #24312e;
+      --muted: #687672;
+      --line: #d4ddda;
+      --canvas: #f6f8f7;
+      --surface: #ffffff;
+      --accent: #4f7fa4;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 817px;
+      height: 560px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #canvas { width: 817px; height: 560px; padding: 14px; }
+    h1, p { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 18px; line-height: 24px; }
+    .subtitle { margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 15px; }
+    .grid {
+      height: 468px;
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .card {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface);
+    }
+    .card strong { display: block; font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
+    .card span {
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 15px;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <main id="canvas">
+    <h1>HTML Box Title</h1>
+    <p class="subtitle">Replace this self-contained template with the complete diagram.</p>
+    <section class="grid">
+      <div class="card">
+        <strong>Node A</strong>
+        <span>Describe the first capability or stage.</span>
+      </div>
+      <div class="card">
+        <strong>Node B</strong>
+        <span>Describe the second capability or stage.</span>
+      </div>
+      <div class="card">
+        <strong>Node C</strong>
+        <span>Describe the third capability or stage.</span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

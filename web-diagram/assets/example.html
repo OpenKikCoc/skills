@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>web-diagram example</title>
+<link rel="stylesheet" href="diag.css">
+<style>
+  body{margin:0;padding:32px 24px 64px;background:#fff;color:#152238;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  main{max-width:1100px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px} h2{font-size:19px;margin:40px 0 4px}
+  p.lead{color:#5b6f88;margin:0 0 12px}
+</style>
+</head>
+<body>
+<main>
+<h1>web-diagram example</h1>
+<p class="lead">Three diagrams on one 1100px logical stage width: architecture, decision flow, sequence.</p>
+
+<h2>1. Architecture: web-shop order pipeline</h2>
+<p class="lead">Groups, typed cards, labelled edges, and one feedback loop routed around the outside with <code>out</code>.</p>
+<div class="diag-wrap"><div class="diag" data-w="1100" data-h="480">
+  <div class="grp" data-label="EDGE" style="left:20px;top:20px;width:260px;height:440px"></div>
+  <div class="grp" data-label="CORE" style="left:340px;top:20px;width:420px;height:440px"></div>
+  <div class="grp" data-label="EXTERNAL" style="left:820px;top:20px;width:260px;height:440px"></div>
+
+  <div class="node" data-node="web" data-kind="primary" data-type="CLIENT" style="left:40px;top:60px;width:220px;height:80px"><h4>Storefront</h4><p>Cart and checkout UI</p></div>
+  <div class="node" data-node="api" data-kind="control" data-type="GATEWAY" style="left:40px;top:200px;width:220px;height:80px"><h4>API gateway</h4><p>Auth, rate limits</p></div>
+
+  <div class="node" data-node="orders" data-kind="compute" data-type="SERVICE" style="left:380px;top:60px;width:360px;height:90px"><h4>Order service</h4><p>Owns the order state machine</p></div>
+  <div class="node" data-node="inv" data-kind="compute" data-type="SERVICE" style="left:380px;top:220px;width:180px;height:80px"><h4>Inventory</h4><p>Stock holds</p></div>
+  <div class="node" data-node="pay" data-kind="compute" data-type="SERVICE" style="left:580px;top:220px;width:140px;height:80px"><h4>Payments</h4><p>Capture funds</p></div>
+  <div class="node" data-node="queue" data-kind="store" data-type="QUEUE" style="left:380px;top:340px;width:360px;height:70px"><h4>Event queue</h4></div>
+  <div class="txt" style="left:380px;top:420px;width:360px">Services talk to each other only through the queue.</div>
+
+  <div class="node" data-node="db" data-kind="store" data-type="DATABASE" style="left:840px;top:60px;width:220px;height:90px"><h4>Orders DB</h4><p>Single writer</p></div>
+  <div class="node" data-node="psp" data-kind="external" data-type="PROVIDER" style="left:840px;top:220px;width:220px;height:80px"><h4>Payment provider</h4><p>Card network</p></div>
+  <div class="node" data-node="mail" data-kind="external" data-type="PROVIDER" style="left:840px;top:340px;width:220px;height:70px"><h4>Email service</h4></div>
+
+  <script type="application/json" class="edges">[
+   {"from":"web","to":"api","label":"checkout"},
+   {"from":"api","to":"orders","label":"place order"},
+   {"from":"orders","to":"inv","fromAt":0.25,"label":"reserve"},
+   {"from":"orders","to":"pay","fromAt":0.75,"label":"charge"},
+   {"from":"orders","to":"db","label":"persist","kind":"data"},
+   {"from":"pay","to":"psp","label":"authorize"},
+   {"from":"inv","to":"queue","toAt":0.25,"label":"reserved","kind":"data"},
+   {"from":"pay","to":"queue","toAt":0.75,"label":"paid","kind":"data"},
+   {"from":"queue","to":"mail","label":"notify","kind":"outcome"},
+   {"from":"queue","to":"web","fromSide":"left","toSide":"left","toAt":0.5,"out":30,"kind":"feedback","label":"order status","dx":80}
+  ]</script>
+</div></div>
+
+<h2>2. Decision flow: CI gate</h2>
+<p class="lead">A small left-to-right flow with a branch and a feedback edge looping back under the whole flow.</p>
+<div class="diag-wrap"><div class="diag" data-w="1100" data-h="320">
+  <div class="node state notype" data-node="push" data-kind="muted" style="left:20px;top:110px;width:160px;height:60px">Commit pushed</div>
+  <div class="node plain center" data-node="build" data-kind="compute" style="left:240px;top:100px;width:180px;height:80px"><h4>Build and test</h4><p>Unit and lint</p></div>
+  <div class="node state notype" data-node="gate" data-kind="note" style="left:480px;top:110px;width:180px;height:60px">Checks green?</div>
+  <div class="node plain center" data-node="deploy" data-kind="ok" style="left:740px;top:40px;width:200px;height:70px"><h4>Deploy to staging</h4></div>
+  <div class="node plain center" data-node="fail" data-kind="bad" style="left:740px;top:180px;width:200px;height:70px"><h4>Notify author</h4></div>
+  <script type="application/json" class="edges">[
+   {"from":"push","to":"build"},
+   {"from":"build","to":"gate"},
+   {"from":"gate","to":"deploy","kind":"outcome","label":"yes"},
+   {"from":"gate","to":"fail","kind":"danger","label":"no"},
+   {"from":"fail","to":"push","fromSide":"bottom","toSide":"bottom","out":40,"kind":"feedback","label":"fix and push again"}
+  ]</script>
+</div></div>
+
+<h2>3. Sequence: checkout call</h2>
+<p class="lead">Participants, a loop frame, replies (dashed), a self-call, and a note.</p>
+<div class="diag-wrap"><div class="diag seq" data-w="1100">
+<script type="application/json" class="seqdef">{
+ "participants":[{"id":"b","label":"Browser","kind":"external"},{"id":"a","label":"Shop API","kind":"control"},{"id":"i","label":"Inventory","kind":"compute"},{"id":"p","label":"Payments","kind":"compute"}],
+ "messages":[
+  {"from":"b","to":"a","label":"POST /checkout"},
+  {"loop":"for each cart line","items":[
+   {"from":"a","to":"i","label":"reserve(sku, qty)"},
+   {"from":"i","to":"a","label":"reserved","reply":true}
+  ]},
+  {"from":"a","to":"a","label":"validate totals"},
+  {"from":"a","to":"p","label":"authorize(card, total)"},
+  {"from":"p","to":"a","label":"approved","reply":true},
+  {"note":"Order is now CONFIRMED","over":["a"]},
+  {"from":"a","to":"b","label":"201 Created","reply":true}
+ ]}</script>
+</div></div>
+</main>
+<script src="diag.js"></script>
+</body>
+</html>
