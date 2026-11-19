@@ -106,10 +106,56 @@ Allowed `checkpoint` patch fields are deliberately narrow:
 
 ```text
 mode, foreground_milestone, milestone_status, next_action,
-suspension_stack, session_status
+suspension_stack, session_status, wave_recovery
 ```
 
 The script owns `state_revision`, `armed`, `armed_by`, `epoch`, `contract_revision`, and timestamps. `checkpoint` cannot arm a session or enter recovery states.
+
+### Parallel wave receipt binding
+
+`wave_recovery` is optional/null for work without an interrupted parallel wave.
+The root packet stays the only foreground cursor; the binding is a receipt
+reference, never another outcome or cursor:
+
+```json
+{
+  "checkpoint_path": "<absolute-durable-checkpoint-path>",
+  "sha256": "<lowercase-sha256-of-exact-file-bytes>",
+  "milestone_id": "<root-foreground-milestone>",
+  "completion": null
+}
+```
+
+The referenced `fleet-parallel-merge` checkpoint must declare
+`cursor_owner: iteration-root-packet` and its single
+`recovery_entry: {kind: resume_validate, checkpoint_path: ...}`. While
+completion is null, root `next_action` is exactly
+`fleet-parallel-merge resume-validate checkpoint <checkpoint_path>`; root
+milestone statuses, foreground and suspension stack cannot advance, the session
+cannot complete, and the binding cannot be dropped or rebound. Ordinary compact
+returns this same action. Wave `current`/`next_action` only describe
+Git/resource substeps.
+
+Set completion to `{path: <absolute-receipt-path>, sha256: <exact-byte-hash>}`
+only after recovery. The root checks a `parallel-wave-resume-validation`
+receipt with matching `cursor_owner`, no blockers, `status: resume_existing`,
+and `checkpoint_sha256` of the checkpoint's canonical rendering (sorted,
+indented JSON plus newline). `reconstruct_fresh` is not completion: restore
+resources under their owner and validate fresh state again. For reconstructed
+resources, persist a successor checkpoint with `predecessor_checkpoint_sha256`
+equal to the original canonical hash, preserving base, plan hash and current
+gate. Completion then also carries `recovered_checkpoint: {path, sha256}`; the
+root verifies the successor's exact bytes, predecessor link, ownership and gate,
+and the receipt must bind that successor. The original binding stays unchanged
+throughout. Root progression may accompany the verified completion patch; a
+later patch may clear the binding. Byte/hash/schema/entry drift is an
+operational blocker, not evidence. Scripts read receipts; they do not execute
+recovery or authenticate model-authored claims.
+
+Older wave checkpoints without these ownership fields fail closed; rebuild a
+new receipt from freshly verified facts, never relabel old evidence. Root
+packets without `wave_recovery` keep their behavior. Fleet dispatch cards use
+only `fleet-dispatch`'s lifecycle, not this composition.
 
 ## 5. Journal events
 

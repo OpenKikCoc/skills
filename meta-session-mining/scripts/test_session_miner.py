@@ -40,7 +40,7 @@ def claude_file(path, sid, asks, sidechain=False, ts="2030-03-03T09:00:00.000Z")
 class RedactionTests(unittest.TestCase):
     def test_secrets_paths_emails(self):
         text = ("mail bob@example.com, file %s/a.py, key sk-abcdefghijklmnopqrstuvwx, "
-                "curl -H 'Authorization: Bearer abcdefgh12345678' https://u:hunter2pass@example.com/x?token=abcd1234efgh" % HOME_DIR)
+                "curl -H 'Authorization: Bearer abcdefgh12345678' https://u:hunter2pass@example.com/x?token=abcd1234efgh" % HOME_DIR)  # skills-repo: allow-test-secret
         out = miner.redact(text)
         for leaked in ("bob@example.com", "alice", "sk-abcdef", "abcdefgh12345678", "hunter2pass", "abcd1234efgh"):
             self.assertNotIn(leaked, out)

@@ -55,6 +55,16 @@ node scripts/preview-html-box.mjs --html box.html --init-script stub.js --click 
 Run once with the stub (success path) and once without (degraded path). Never
 publish the stub or its fixture data inside the box.
 
+Deadline: the whole preview, including browser start, page load, evaluation,
+screenshot, and file output, is bounded by `--timeout-ms` (default 30000).
+Every DevTools request and the load wait have their own bound inside it. On
+timeout, SIGINT, or SIGTERM the script rejects all pending requests, stops the
+browser it started (SIGTERM, then SIGKILL after a short grace), removes the
+temporary profile, and exits non-zero. Input and output paths must be regular
+files: FIFOs and devices are rejected, and file reads and writes run in a
+short-lived owned child process so a stalled filesystem cannot outlive the
+deadline.
+
 Report fields: `viewport`, `bounds`, `textOverflow`, `longTokens` (warnings),
 `expectedCounts`, `htmlSha256`, `screenshot`. The script exits non-zero if the
 viewport scrolls, a major region leaves the viewport, text overflows, an

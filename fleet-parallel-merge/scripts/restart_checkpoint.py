@@ -514,6 +514,8 @@ def build_checkpoint(document: Any) -> dict[str, Any]:
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "kind": CHECKPOINT_KIND,
+        "cursor_owner": "iteration-root-packet",
+        "recovery_entry": {"kind": "resume_validate", "checkpoint_path": checkpoint_path},
         "base_sha": base_sha,
         "plan_sha256": plan_sha256,
         "current": current,
@@ -525,6 +527,10 @@ def build_checkpoint(document: Any) -> dict[str, Any]:
         "state_path": state_path,
         "next_action": next_action,
     }
+    if "predecessor_checkpoint_sha256" in root:
+        receipt["predecessor_checkpoint_sha256"] = _sha256(
+            root["predecessor_checkpoint_sha256"], "predecessor_checkpoint_sha256"
+        )
     _safe_payload(receipt, "checkpoint receipt")
     return receipt
 
@@ -557,10 +563,22 @@ def _checkpoint_receipt(value: Any) -> dict[str, Any]:
         source.get("checkpoint_path"), "checkpoint.checkpoint_path"
     )
     state_path = _absolute_path(source.get("state_path"), "checkpoint.state_path")
+    if source.get("cursor_owner") != "iteration-root-packet":
+        raise ContractError("checkpoint.cursor_owner must be iteration-root-packet")
+    if source.get("recovery_entry") != {"kind": "resume_validate", "checkpoint_path": checkpoint_path}:
+        raise ContractError("checkpoint.recovery_entry must name this checkpoint's resume_validate entry")
     next_action = _action(source.get("next_action"), "checkpoint.next_action")
+    predecessor = {}
+    if "predecessor_checkpoint_sha256" in source:
+        predecessor["predecessor_checkpoint_sha256"] = _sha256(
+            source["predecessor_checkpoint_sha256"], "checkpoint.predecessor_checkpoint_sha256"
+        )
     return {
+        **predecessor,
         "schema_version": SCHEMA_VERSION,
         "kind": CHECKPOINT_KIND,
+        "cursor_owner": "iteration-root-packet",
+        "recovery_entry": {"kind": "resume_validate", "checkpoint_path": checkpoint_path},
         "base_sha": base_sha,
         "plan_sha256": plan_sha256,
         "current": current,
@@ -1072,6 +1090,8 @@ def validate_resume(document: Any) -> dict[str, Any]:
     result = {
         "schema_version": SCHEMA_VERSION,
         "kind": RESUME_KIND,
+        "cursor_owner": "iteration-root-packet",
+        "checkpoint_sha256": _rendered_sha256(raw_checkpoint),
         "status": status,
         "base_sha": checkpoint["base_sha"],
         "plan_sha256": checkpoint["plan_sha256"],

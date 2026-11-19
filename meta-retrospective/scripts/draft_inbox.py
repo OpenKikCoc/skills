@@ -24,15 +24,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from credential_policy import credential_findings  # noqa: E402
+
 TRIGGERS = ("user_correction", "repeated_failure", "retrospective")
 TARGETS = ("draft_only", "project_guidance", "existing_skill", "casebook", "memory", "new_skill")
 DECISIONS = ("promoted", "rejected", "deferred")
 REQUIRED = ("title", "trigger", "mechanism", "evidence", "target", "proposed_change", "existing_rule_checked")
-SECRET_RE = re.compile(
-    r"(?i)(-----BEGIN [A-Z ]*PRIVATE KEY-----|\bsk-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|"
-    r"\b(?:password|token|secret|api[_-]?key)\b\s*[:=]\s*\S{8,})"
-)
-HOME_RE = re.compile(r"(?:/Users|/home)/[A-Za-z0-9._-]+/")
 NAME_RE = re.compile(r"^[0-9a-f]{16}-[a-z0-9-]{1,48}\.json$")
 
 
@@ -40,7 +38,15 @@ class InboxError(Exception):
     pass
 
 
+def reject_credentials(value: Any, what: str) -> None:
+    """Refuse credential-like content. Reports labels only, never the matched text."""
+    kinds = credential_findings(value)
+    if kinds:
+        raise InboxError("%s contains credential-like content (%s); redact it first" % (what, ", ".join(kinds)))
+
+
 def validate_packet(packet: Any) -> Dict[str, Any]:
+    reject_credentials(packet, "packet")
     if not isinstance(packet, dict):
         raise InboxError("packet must be a JSON object")
     missing = [k for k in REQUIRED if k not in packet]
@@ -64,9 +70,6 @@ def validate_packet(packet: Any) -> Dict[str, Any]:
         raise InboxError("evidence must be 1-12 non-empty strings")
     if packet["target"] != "draft_only" and not packet.get("target_ref"):
         raise InboxError("target_ref (skill name, file, or memory entry) is required for target %s" % packet["target"])
-    blob = json.dumps(packet)
-    if SECRET_RE.search(blob) or HOME_RE.search(blob):
-        raise InboxError("packet contains a secret-like value or an absolute home path; redact it first")
     clean = {k: packet[k] for k in REQUIRED}
     clean["blocking"] = False
     if packet.get("target_ref"):
@@ -116,7 +119,11 @@ def propose(inbox: Path, packet: Any) -> Dict[str, Any]:
 def latest_decision(inbox: Path, draft: str) -> Optional[Dict[str, Any]]:
     receipts = sorted((inbox / "decisions").glob(draft[:-5] + ".r*.json")) if (inbox / "decisions").is_dir() else []
     receipts.sort(key=lambda p: int(p.name.rsplit(".r", 1)[1].split(".")[0]))
-    return json.loads(receipts[-1].read_text(encoding="utf-8")) if receipts else None
+    if not receipts:
+        return None
+    receipt = json.loads(receipts[-1].read_text(encoding="utf-8"))
+    reject_credentials(receipt, "decision receipt")
+    return receipt
 
 
 def list_drafts(inbox: Path) -> List[Dict[str, Any]]:
@@ -127,7 +134,18 @@ def list_drafts(inbox: Path) -> List[Dict[str, Any]]:
         except (OSError, ValueError):
             rows.append({"draft": path.name, "status": "unreadable"})
             continue
-        decision = latest_decision(inbox, path.name)
+        kinds = credential_findings(data)
+        if kinds:
+            rows.append({"draft": path.name, "status": "unsafe_draft", "unsafe_kinds": list(kinds)})
+            continue
+        try:
+            decision = latest_decision(inbox, path.name)
+        except InboxError:
+            rows.append({"draft": path.name, "status": "unsafe_decision"})
+            continue
+        except (OSError, ValueError):
+            rows.append({"draft": path.name, "status": "unreadable_decision"})
+            continue
         rows.append({
             "draft": path.name, "title": data.get("title"), "target": data.get("target"),
             "target_ref": data.get("target_ref", ""),
@@ -143,8 +161,7 @@ def decide(inbox: Path, draft: str, decision: str, note: str) -> Dict[str, Any]:
         raise InboxError("decision must be one of: %s" % ", ".join(DECISIONS))
     if not note.strip():
         raise InboxError("a note is required")
-    if SECRET_RE.search(note) or HOME_RE.search(note):
-        raise InboxError("note contains a secret-like value or an absolute home path")
+    reject_credentials(note, "note")
     revision = 1 + len(list((inbox / "decisions").glob(draft[:-5] + ".r*.json"))) if (inbox / "decisions").is_dir() else 1
     draft_digest = hashlib.sha256((inbox / "drafts" / draft).read_bytes()).hexdigest()
     receipt = {"draft": draft, "draft_sha256": draft_digest, "decision": decision, "note": note.strip(), "revision": revision}

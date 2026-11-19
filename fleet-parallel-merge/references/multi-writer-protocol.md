@@ -140,5 +140,34 @@ After restart, run `resume-validate` against newly observed state:
 - block when an old root survives without its manifest, a unique commit lacks a
   durable ref, or stale worker state is presented as success.
 
-A checkpoint is not acceptance, integration evidence, cleanup authority, or
-permission to reuse a historical path.
+### Cursor ownership and recovery entry
+
+When the wave runs under a `dev-iteration-loop` root packet, that root alone
+owns the user outcome, foreground milestone and foreground `next_action`. The
+wave checkpoint owns Git/resource recovery only; its `current` and structured
+`next_action` are recovery substeps, not a second session cursor or host goal.
+The checkpoint therefore declares:
+
+- `cursor_owner: iteration-root-packet`;
+- one `recovery_entry: {kind: resume_validate, checkpoint_path: <this path>}`.
+
+Both are validated on build and on `resume-validate`; a different owner or a
+path that does not name this checkpoint is rejected. The root references the
+checkpoint by path and exact byte SHA-256 (its `wave_recovery` binding) and
+points its own `next_action` at the single entry. The resume receipt emits
+`cursor_owner` and `checkpoint_sha256` (hash of the canonical rendering: sorted,
+indented JSON plus newline); only `resume_existing` with no blockers completes
+root wave recovery.
+
+After `reconstruct_fresh`, allocate or restore resources under their owner,
+then persist a successor checkpoint with the same base, plan hash and current
+gate plus `predecessor_checkpoint_sha256` equal to the original canonical hash,
+and validate that successor against newly observed state. `reconstruct_fresh`
+only advises; it does not prove allocation happened.
+
+Checkpoints or receipts that lack the ownership fields are never silently
+upgraded or relabelled: they fail closed, and a new checkpoint is rebuilt from
+freshly observed facts.
+
+A checkpoint is not acceptance, integration evidence, cleanup authority,
+permission to reuse a historical path, or user-outcome acceptance.

@@ -73,8 +73,13 @@ python3 <skill-root>/scripts/draft_inbox.py --inbox <dir> decide \
 ```
 
 Packet fields and rules: [proposal-packet.md](references/proposal-packet.md).
-The script rejects secret-like values and absolute home paths, blocking
-proposals, and unknown targets. Decisions (`promoted`, `rejected`, `deferred`)
+The script rejects credential-like content (recursively, in strings and field
+names: private keys, Bearer/Basic headers, `?token=`/`key=` query secrets,
+refresh tokens, JWTs, URI passwords, token prefixes, credential-named fields,
+absolute home paths), blocking proposals, and unknown targets. Errors name only
+the kind of finding, never the matched text. `list` and decision reads apply
+the same check and report `unsafe_draft` / `unsafe_decision` instead of
+printing the content. Decisions (`promoted`, `rejected`, `deferred`)
 are separate receipts; drafts never change.
 
 ## Boundary
@@ -91,4 +96,5 @@ record.
 
 ```bash
 python3 -I <skill-root>/scripts/test_draft_inbox.py
+python3 -I <skill-root>/scripts/test_credential_policy.py
 ```

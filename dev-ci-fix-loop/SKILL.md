@@ -13,11 +13,14 @@ or plausible diagnosis is not completion.
 
 ## Loop
 
-1. Authenticate the CI client (`gh auth status`, `glab auth status`) from the
-   same host/HOME context that will run Git. A sandbox may see the CLI's
-   stored status while still lacking push credentials. Run authentication,
-   Git push, and the full pipeline loop where credentials actually work; use
-   sandbox status only as a diagnostic probe.
+1. Probe credentials per action (CI reads, authentication, Git transport) in
+   the context that will execute that action; a status shown elsewhere does
+   not prove readiness. Keep read-only diagnosis and local tests in the
+   minimal permitted context. This skill does not authorize escaping the
+   current sandbox. If an action needs unavailable credentials or permissions,
+   preserve local work and report that action's context gap instead of moving
+   the whole loop. CLI syntax comes from its `--help` output, never from
+   memory.
 2. Confirm repository, PR/MR, branch, current `HEAD`, PR/MR source SHA, dirty files,
    protected user changes, required local gates, and whether commit/push is in
    scope.
@@ -50,19 +53,13 @@ or plausible diagnosis is not completion.
    merely to end the loop.
 11. Read the PR/MR source SHA again, observe checks for that exact SHA, and repeat.
     Use bounded polling with progress updates for queued or running checks.
-12. Before a delivery claim, assemble a source-SHA evidence epoch covering
-    local gates, remote checks, composed/generated artifacts, and release
-    receipts. Validate it offline:
-
-    ```bash
-    <skill-root>/scripts/delivery_evidence_epoch.py delivery-evidence.json
-    ```
-
-    Freeze the source under test as implementation revision `I`. Prefer one
-    revision. A later evidence revision `E` is valid only when it binds the
-    immutable plan, repository/checkout identity, and commands from `I`,
-    preserves the source tree, changes only declared evidence paths, and
-    carries reproducible input/output and authority-ledger digests.
+12. A plain "make CI green" task ends with the evaluator and the latest-SHA
+    check report, not a delivery epoch. Only when a frozen delivery contract
+    declares a generated-artifact or release boundary, load
+    [delivery-evidence-epoch.md](references/delivery-evidence-epoch.md) and
+    follow its contract-scoped evidence requirements before claiming that
+    delivery; CI green alone cannot satisfy them. Never invent a release
+    obligation or silently omit one the contract already requires.
 
 ## State Actions
 
@@ -79,7 +76,7 @@ or plausible diagnosis is not completion.
 For each diagnosis retain the PR/MR, expected SHA, check name/id, required flag,
 status/conclusion, job run, failed step, pipeline version, and selected
 artifact or log locator. Record local commands and results before each push.
-For a delivery claim, read
+For a contract-declared delivery boundary, also read
 [delivery-evidence-epoch.md](references/delivery-evidence-epoch.md) and retain
 the validated normalized packet. A source-dependent receipt is usable only for
 its named source SHA; source-independent reuse must be explicitly typed and

@@ -1,9 +1,32 @@
 # Delivery Evidence Epoch
 
-Use one normalized packet when the delivery claim extends beyond CI status to
-local validation, remote checks, composed or generated outputs, and release
-publication. The validator is pure: it checks consistency and provenance but
-does not execute commands, inspect Git, or contact a remote service.
+Load this reference only when a frozen delivery contract declares a
+generated-artifact or release boundary. A plain CI-green task ends with
+`evaluate_pipeline.py` and does not create a delivery packet. The validator is
+pure: it checks consistency and provenance but does not execute commands,
+inspect Git, or contact a remote service.
+
+## Contract Scope
+
+Freeze the delivery contract before collecting delivery evidence. Name the
+source under test, bounded delivery claim, generated outputs or release
+boundary, required lanes, targets/profiles, authorities, and commands. Bind it
+in the immutable plan at implementation revision `I`; do not redefine scope
+from whichever receipts happen to be available.
+
+The schema-version-1 validator is a full-delivery, four-lane contract: local
+validation, remote CI, generated/composed outputs, and release publication.
+Invoke it only when the frozen contract requires all four lanes. For a
+narrower artifact-only contract, verify the declared outputs, hashes, source
+binding, and every required lane with the owning artifact workflow; do not
+invoke this validator, fabricate a release lane, or claim full delivery. A
+CI-only contract does not load this reference at all.
+
+Do not fabricate receipts or unrelated commands to fill a lane. Never drop a
+required lane to obtain readiness: missing required evidence is a blocker for
+that delivery claim, even when CI is green. If the contract is absent or
+ambiguous, report CI status separately and resolve delivery scope first. This
+reference grants no publication or release authority.
 
 ## Revision Model
 

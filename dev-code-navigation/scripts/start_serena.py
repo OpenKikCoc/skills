@@ -26,13 +26,9 @@ TOOLS = (
     "find_symbol", "find_referencing_symbols", "find_implementations",
     "find_declaration", "restart_language_server",
 )
-DEFAULT_EXCLUDED_PARTS = (
-    (".claude", "worktrees"),
-    ("workdir", "repos"),
-    ("workdir", "baselines"),
-    ("runtime", "data", "workspaces"),
-    ("raw", "shards"),
-)
+DEFAULT_EXCLUDED_PARTS = (("tmp",), (".tmp",), (".cache",), ("__pycache__",))
+PRUNED_DIRECTORIES = {".git": "Git metadata", "vendor": "dependency directory",
+                      "node_modules": "dependency directory"}
 SOURCE_SUFFIXES = (
     ".go", ".py", ".rs", ".java", ".kt", ".kts", ".c", ".cc",
     ".cpp", ".h", ".hpp", ".ts", ".tsx", ".js", ".jsx", ".rb",
@@ -91,8 +87,38 @@ def _contains_parts(path: Path, parts: tuple[str, ...]) -> bool:
     return any(values[index:index + size] == parts for index in range(len(values) - size + 1))
 
 
-def discover_projects(roots: Iterable[Path]) -> list[Path]:
+def configured_excluded_parts() -> tuple[tuple[str, ...], ...]:
+    """Parse SERENA_DISCOVERY_EXCLUDES: a JSON list of relative directory paths."""
+    try:
+        values = json.loads(os.environ.get("SERENA_DISCOVERY_EXCLUDES", "[]"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SERENA_DISCOVERY_EXCLUDES is not valid JSON: {exc.msg}") from None
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ValueError("SERENA_DISCOVERY_EXCLUDES must be a JSON list of relative directory paths")
+    parts = []
+    for value in values:
+        path = Path(value)
+        if not value or path.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
+            raise ValueError("SERENA_DISCOVERY_EXCLUDES entries must be non-empty relative directory paths")
+        parts.append(path.parts)
+    return tuple(parts)
+
+
+def discover_projects(roots: Iterable[Path], excluded_report: list[dict] | None = None) -> list[Path]:
+    """Find Git repositories below explicit roots.
+
+    Exclusions apply to paths *below* a root (matched on the root-relative path), so
+    an explicitly configured root is always scanned even if its own path contains an
+    excluded name. Every exclusion is appended to ``excluded_report`` when given.
+    """
     projects: set[Path] = set()
+    exclusions = [(parts, "temporary directory") for parts in DEFAULT_EXCLUDED_PARTS]
+    exclusions.extend((parts, "configured SERENA_DISCOVERY_EXCLUDES") for parts in configured_excluded_parts())
+
+    def record(path: Path, pattern: str, reason: str) -> None:
+        if excluded_report is not None:
+            excluded_report.append({"path": str(path), "pattern": pattern, "reason": reason})
+
     for root in roots:
         if not root.is_dir():
             continue
@@ -104,11 +130,17 @@ def discover_projects(roots: Iterable[Path]) -> list[Path]:
             continue
         for current, directories, files in os.walk(root):
             path = Path(current)
-            if any(_contains_parts(path.relative_to(root), excluded) for excluded in DEFAULT_EXCLUDED_PARTS):
+            matched = next(((parts, reason) for parts, reason in exclusions
+                            if _contains_parts(path.relative_to(root), parts)), None)
+            if matched:
+                record(path, "/".join(matched[0]), matched[1])
                 directories[:] = []
                 continue
             is_repository = ".git" in directories or ".git" in files
-            directories[:] = sorted(name for name in directories if name not in (".git", "vendor", "node_modules"))
+            for name in sorted(directories):
+                if name in PRUNED_DIRECTORIES:
+                    record(path / name, name, PRUNED_DIRECTORIES[name])
+            directories[:] = sorted(name for name in directories if name not in PRUNED_DIRECTORIES)
             if is_repository:
                 projects.add(path.resolve())
                 # A nested repository is a complete discovery result. Do not scan its
@@ -319,7 +351,7 @@ def first_source_file(
     candidates = [name for name in result.stdout.splitlines() if (project / name).suffix.lower() in allowed_suffixes]
     if ignored_paths:
         if ignore_filter is None:
-            raise ValueError("ignored_paths require the Serena GitWildMatch filter")
+            raise ValueError("ignored_paths require the Serena gitignore-style filter")
         candidates = ignore_filter(candidates, ignored_paths)
     for name in candidates:
         path = project / name
@@ -899,7 +931,8 @@ def main() -> int:
         check_home = state_root / "sessions" / "<connection>"
         command, env, _ = launch_spec(cwd, check_home, state_root)
         cli = command[:command.index("start-mcp-server")]
-        discovered = discover_projects(workspace_roots())
+        excluded_report: list[dict] = []
+        discovered = discover_projects(workspace_roots(), excluded_report)
         preflight = preflight_projects([root], path=env["PATH"]) if root else []
         binding = binding_report(root, expected)
         output = {
@@ -912,6 +945,7 @@ def main() -> int:
             "runtime_identity": runtime_identity(cli),
             "workspace_roots": [str(path) for path in workspace_roots()],
             "discovered_projects": len(discovered),
+            "discovery_exclusions": excluded_report,
             "configured_projects": 0,
             "tools": TOOLS,
         }
@@ -929,7 +963,8 @@ def main() -> int:
     try:
         command, env, _ = launch_spec(cwd, runtime_home, state_root)
         cli = command[:command.index("start-mcp-server")]
-        discovered = discover_projects(workspace_roots())
+        excluded_report: list[dict] = []
+        discovered = discover_projects(workspace_roots(), excluded_report)
         if startup_project is not None and startup_project not in discovered:
             discovered.append(startup_project)
             discovered.sort()
@@ -944,7 +979,8 @@ def main() -> int:
         write_runtime_config(runtime_home, runtime_home, [])
         ready, failures = ensure_project_configs(cli, env, runtime_home, selected)
         if args.discover:
-            print(json.dumps({"projects": [str(path) for path in ready], "failures": failures}, indent=2))
+            print(json.dumps({"projects": [str(path) for path in ready], "failures": failures,
+                              "discovery_exclusions": excluded_report}, indent=2))
             return 1 if failures else 0
         target_failures = failures
         selected_names = {str(path) for path in selected}

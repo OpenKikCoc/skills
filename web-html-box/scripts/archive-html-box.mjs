@@ -8,14 +8,19 @@ import { pathToFileURL } from "node:url";
 
 function usage() {
   console.log(`Usage:
-  archive-html-box.mjs archive --html <file> --out <dir> [--target-kind K] [--target-id ID] [--preview png]
-  archive-html-box.mjs extract --json <file> --field <dotted.path> --out <dir> [--target-kind K] [--target-id ID] [--preview png]
+  archive-html-box.mjs archive --html <file> --out <dir> [--target-kind K] [--target-id ID] [--preview png] [--expect-old-sha256 HEX]
+  archive-html-box.mjs extract --json <file> --field <dotted.path> --out <dir> [--target-kind K] [--target-id ID] [--preview png] [--expect-old-sha256 HEX]
   archive-html-box.mjs verify  --dir <archive-dir> --readback <file>
 
 archive  Store a local HTML file as index.html plus manifest.json.
 extract  Pull the HTML string out of a stored record (JSON file) first. The
          field may hold the HTML directly or a JSON string/object that itself
          has an "html" key. The raw record is kept as record.json.
+
+--expect-old-sha256 pins the old box to the hash of the approved old source.
+A mismatch exits non-zero before anything is written: do not insert the
+replacement and do not delete the old copy.
+
 verify   Compare sha256 of a read-back copy with the manifest. Exit 0 only on
          an exact byte match; only then delete the old copy.
 `);
@@ -56,7 +61,26 @@ export function htmlFromRecord(json, field) {
   return { html: value, record };
 }
 
-export function buildManifest(html, meta = {}) {
+export function assertExpectedHash(html, expected) {
+  if (expected === undefined) return;
+  if (!/^[0-9a-f]{64}$/.test(expected)) throw new Error("--expect-old-sha256 must be 64 lowercase hex characters");
+  const actual = sha256(html);
+  if (actual !== expected) {
+    throw new Error(`old box sha256 ${actual} does not match the approved ${expected}; no archive written, do not insert or delete`);
+  }
+}
+
+export function readSourceFile(file) {
+  const resolved = path.resolve(file);
+  const info = fs.lstatSync(resolved);
+  if (info.isSymbolicLink()) throw new Error(`refusing symlink source: ${file}`);
+  if (!info.isFile()) throw new Error(`source must be a regular file: ${file}`);
+  const html = fs.readFileSync(resolved, "utf8");
+  if (!html.trim()) throw new Error(`source is empty: ${file}`);
+  return html;
+}
+
+export function manifestFor(html, meta = {}) {
   return {
     schema_version: 1,
     title: titleFromHtml(html),
@@ -82,7 +106,7 @@ export function writeArchive(outDir, html, meta = {}) {
     preview = "preview.png";
     fs.copyFileSync(path.resolve(meta.previewSource), path.join(dir, preview));
   }
-  const manifest = buildManifest(html, { ...meta, preview });
+  const manifest = manifestFor(html, { ...meta, preview });
   fs.writeFileSync(path.join(dir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
 }
@@ -109,6 +133,7 @@ function parseArgs(argv) {
     "--html": "html", "--out": "out", "--json": "json", "--field": "field",
     "--dir": "dir", "--readback": "readback", "--preview": "preview",
     "--target-kind": "targetKind", "--target-id": "targetId",
+    "--expect-old-sha256": "expectOldSha256",
   };
   for (let i = 0; i < rest.length; i += 1) {
     const key = keys[rest[i]];
@@ -127,10 +152,13 @@ function main() {
   let manifest;
   if (args.cmd === "archive") {
     if (!args.html || !args.out) throw new Error("--html and --out are required");
-    manifest = writeArchive(args.out, fs.readFileSync(path.resolve(args.html), "utf8"), meta);
+    const html = readSourceFile(args.html);
+    assertExpectedHash(html, args.expectOldSha256);
+    manifest = writeArchive(args.out, html, meta);
   } else if (args.cmd === "extract") {
     if (!args.json || !args.field || !args.out) throw new Error("--json, --field and --out are required");
     const { html, record } = htmlFromRecord(JSON.parse(fs.readFileSync(path.resolve(args.json), "utf8")), args.field);
+    assertExpectedHash(html, args.expectOldSha256);
     manifest = writeArchive(args.out, html, { ...meta, record });
   } else if (args.cmd === "verify") {
     if (!args.dir || !args.readback) throw new Error("--dir and --readback are required");

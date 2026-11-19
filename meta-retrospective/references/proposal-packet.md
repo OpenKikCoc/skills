@@ -23,4 +23,8 @@ Draft file names are `<16 hex digest>-<title slug>.json`; decision receipts are
 `<draft name>.r<N>.json` in the sibling `decisions/` directory.
 
 Redact before submitting: the script refuses obvious secrets and absolute home
-paths but cannot recognize every private identifier.
+paths but cannot recognize every private identifier. Detection lives in one
+module (`scripts/credential_policy.py`) and is exercised by one synthetic
+fixture list (`scripts/credential_fixtures.py`) in every consumer test; add a
+new pattern there and a fixture, and all consumers pick it up. Placeholders
+such as `<redacted>` or `${VAR}` are allowed.

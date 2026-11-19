@@ -66,6 +66,41 @@ If a runtime lacks a tier, `route` clamps to the nearest supported level **up**
 for workers and reviewers and records the clamp. Verify supported levels with
 the CLI's own `--help` before adding a runtime; flags differ between versions.
 
+## Approved tiers (optional)
+
+When the fleet should only ever run a few reviewed (model, effort) pairs, define
+them once in `fleet.json` and let a card name one:
+
+```json
+"model_tiers": {
+  "standard":        {"model": "<main model>", "effort": "high",  "reviewer": "standard-review"},
+  "standard-review": {"model": "<main model>", "effort": "xhigh"},
+  "deep":            {"model": "<main model>", "effort": "xhigh", "reviewer": "deep-review"},
+  "deep-review":     {"model": "<main model>", "effort": "max"}
+}
+```
+
+A card then says `tier: standard` (and optionally `reviewer_tier: deep-review`)
+instead of relying on the complexity score. Rules, all fail-closed:
+
+- `model_tiers` must be complete: every entry has a non-empty `model` and
+  `effort`; a `reviewer` link must name another entry; no two names may share
+  the same (model, effort) tuple; names may not shadow `low`/`medium`/`high`/
+  `xhigh`/`max`; JSON objects with duplicate keys are rejected.
+- A card with `tier:` and no usable config, an unknown name, an empty value, or
+  both `tier` and `effort`, is refused by `route` and `launch`.
+- The reviewer tier is the `reviewer` mapped from the worker's tier unless the
+  card gives `reviewer_tier`. A tier with neither is refused.
+- A relaunch without `--tier` keeps the registered (model, effort, tier) tuple
+  exactly, even if the config or the card's signals changed since; only an
+  explicit `launch --tier NAME` changes it (and records the new tuple). This
+  applies to complexity-routed cards too.
+- `escalate` is for the complexity ladder only; a worker on an approved tier is
+  changed with `launch --tier`.
+- The coordinator's effort or runtime can change only while it is idle, as a new
+  generation that starts from its HANDOFF (a `coordinator:tuple_changed` event
+  records it). A running coordinator is never reconfigured in place.
+
 ## Escalation and de-escalation
 
 Effort is fixed for a generation. Changing it mid-session is forbidden for the

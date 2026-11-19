@@ -7,6 +7,7 @@ import argparse
 import copy
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -27,7 +28,7 @@ INSTRUCTION_CLASSES = {"CLARIFY", "ADD", "PAUSE", "SUPERSEDE", "INDEPENDENT"}
 WORKER_STATUSES = {"registered", "running", "awaiting_review", "reviewed", "lost", "conflicted"}
 EFFECT_STATUSES = {"confirmed", "failed", "unknown"}
 RECORDABLE_EVENTS = {"decision", "evidence", "evidence_invalidated", "worker"}
-PATCH_FIELDS = {"mode", "foreground_milestone", "milestone_status", "next_action", "suspension_stack", "session_status"}
+PATCH_FIELDS = {"mode", "foreground_milestone", "milestone_status", "next_action", "suspension_stack", "session_status", "wave_recovery"}
 TRANSITIONS = {
     "PENDING": {"ACTIVE", "SUPERSEDED"},
     "ACTIVE": {"REVIEW", "PAUSED", "BLOCKED", "COMPLETE", "SUPERSEDED"},
@@ -192,6 +193,73 @@ def acceptance_map(contract: dict[str, Any]) -> dict[str, tuple[str, bool]]:
     }
 
 
+def wave_recovery_action(binding: dict[str, Any]) -> str:
+    return "fleet-parallel-merge resume-validate checkpoint " + binding["checkpoint_path"]
+
+
+def hashed_receipt(path_value: Any, digest: Any, field: str) -> dict[str, Any]:
+    path = Path(require_text(path_value, f"{field}.path"))
+    require(path.is_absolute(), f"{field}.path must be absolute")
+    require(isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest),
+            f"{field}.sha256 must be a lowercase SHA-256 digest")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"{field} receipt unavailable") from exc
+    require(hashlib.sha256(raw).hexdigest() == digest, f"{field} receipt hash mismatch")
+    try:
+        return require_object(json.loads(raw), field)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ContractError(f"{field} receipt is not a JSON object") from exc
+
+
+def validate_wave_recovery(state: dict[str, Any]) -> None:
+    binding = state.get("wave_recovery")
+    if binding is None:
+        return
+    binding = require_object(binding, "wave recovery")
+    require(set(binding) == {"checkpoint_path", "sha256", "milestone_id", "completion"},
+            "wave recovery has unsupported or missing fields")
+    checkpoint = hashed_receipt(binding["checkpoint_path"], binding["sha256"], "wave recovery checkpoint")
+    require(checkpoint.get("schema_version") == 1 and checkpoint.get("kind") == "parallel-wave-restart-checkpoint",
+            "wave recovery requires a parallel checkpoint receipt")
+    require(checkpoint.get("cursor_owner") == "iteration-root-packet", "wave recovery cursor belongs to the adaptive root")
+    require(checkpoint.get("checkpoint_path") == binding["checkpoint_path"], "wave recovery checkpoint path mismatch")
+    require(checkpoint.get("recovery_entry") == {"kind": "resume_validate", "checkpoint_path": binding["checkpoint_path"]},
+            "wave recovery requires the single resume_validate entry")
+    milestone_id = require_text(binding["milestone_id"], "wave recovery milestone_id")
+    require(milestone_id in state["milestone_status"], "wave recovery references unknown milestone")
+    completion = binding["completion"]
+    if completion is None:
+        require(state["foreground_milestone"] == binding["milestone_id"], "pending wave recovery owns the foreground milestone")
+        require(state["next_action"] == wave_recovery_action(binding), "pending wave recovery requires its single root next_action")
+    else:
+        completion = require_object(completion, "wave recovery completion")
+        require(set(completion) in ({"path", "sha256"}, {"path", "sha256", "recovered_checkpoint"}),
+                "wave recovery completion requires path, sha256, and optional recovered_checkpoint")
+        receipt = hashed_receipt(completion["path"], completion["sha256"], "wave recovery completion")
+        rendered = json.dumps(checkpoint, indent=2, sort_keys=True) + "\n"
+        if "recovered_checkpoint" in completion:
+            recovered = require_object(completion["recovered_checkpoint"], "wave recovery recovered_checkpoint")
+            require(set(recovered) == {"path", "sha256"}, "wave recovery recovered_checkpoint requires path and sha256")
+            successor = hashed_receipt(recovered["path"], recovered["sha256"], "wave recovery recovered checkpoint")
+            require(successor.get("schema_version") == 1 and successor.get("kind") == "parallel-wave-restart-checkpoint"
+                    and successor.get("cursor_owner") == "iteration-root-packet"
+                    and successor.get("checkpoint_path") == recovered["path"]
+                    and successor.get("recovery_entry") == {"kind": "resume_validate", "checkpoint_path": recovered["path"]}
+                    and successor.get("predecessor_checkpoint_sha256") == hashlib.sha256(rendered.encode()).hexdigest(),
+                    "wave recovery recovered checkpoint must bind its predecessor")
+            require(all(successor.get(key) == checkpoint.get(key) for key in ("base_sha", "plan_sha256", "current")),
+                    "wave recovery recovered checkpoint cannot advance the wave or change its plan/base")
+            rendered = json.dumps(successor, indent=2, sort_keys=True) + "\n"
+        require(receipt.get("schema_version") == 1 and receipt.get("kind") == "parallel-wave-resume-validation"
+                and receipt.get("cursor_owner") == "iteration-root-packet"
+                and receipt.get("checkpoint_sha256") == hashlib.sha256(rendered.encode()).hexdigest(),
+                "wave recovery completion must bind this checkpoint")
+        require(receipt.get("status") == "resume_existing" and receipt.get("blockers") == [],
+                "wave recovery is incomplete: fresh reconstruction or blockers remain")
+
+
 def validate_state(state: dict[str, Any], contract: dict[str, Any]) -> None:
     require(state.get("schema_version") == SCHEMA_VERSION, "unsupported state schema_version")
     require(isinstance(state.get("state_revision"), int) and state["state_revision"] > 0, "state_revision must be a positive integer")
@@ -250,6 +318,8 @@ def validate_state(state: dict[str, Any], contract: dict[str, Any]) -> None:
     require(current_authority is None or isinstance(current_authority, dict), "workspace_authority must be null or an object")
     if isinstance(current_authority, dict):
         validate_authority(current_authority, "workspace_authority")
+    if state.get("wave_recovery") is not None:
+        require_object(state["wave_recovery"], "wave recovery")
     require_text(state.get("updated_at"), "state.updated_at")
 
 
@@ -433,6 +503,10 @@ def completion_evidence_gaps(
 def operational_blockers(contract: dict[str, Any], state: dict[str, Any], events: list[dict[str, Any]]) -> list[str]:
     view = project(events)
     blockers: list[str] = []
+    try:
+        validate_wave_recovery(state)
+    except ContractError as exc:
+        blockers.append(f"wave_recovery:{exc}")
     if state["contract_revision"] != contract["revision"]:
         blockers.append("contract_revision_mismatch")
     for milestone_id, acceptance_ids in sorted(completion_evidence_gaps(contract, state, events).items()):
@@ -544,6 +618,7 @@ def result_summary(contract: dict[str, Any], state: dict[str, Any], events: list
         "epoch": state["epoch"],
         "foreground_milestone": state["foreground_milestone"],
         "next_action": state["next_action"],
+        "wave_recovery": state.get("wave_recovery"),
         "workspace_authority": state["workspace_authority"],
         "valid_evidence": sorted(view["valid_evidence"]),
         "invalidated_evidence": view["invalidated_evidence"],
@@ -659,6 +734,21 @@ def cmd_checkpoint(args: argparse.Namespace, paths: dict[str, Path], workspace: 
         candidate["foreground_milestone"] = None
         candidate["next_action"] = None
     validate_state(candidate, contract)
+    old_wave = state.get("wave_recovery")
+    new_wave = candidate.get("wave_recovery")
+    if old_wave is not None and old_wave.get("completion") is None:
+        require(new_wave is not None and all(new_wave.get(key) == old_wave.get(key)
+                for key in ("checkpoint_path", "sha256", "milestone_id")),
+                "pending wave recovery cannot be dropped or rebound")
+        if new_wave.get("completion") is None:
+            require(candidate["milestone_status"] == state["milestone_status"]
+                    and candidate["foreground_milestone"] == state["foreground_milestone"]
+                    and candidate["suspension_stack"] == state["suspension_stack"]
+                    and candidate["session_status"] != "COMPLETE",
+                    "root milestones cannot advance before wave recovery completes")
+    if old_wave is not None and old_wave.get("completion") is not None:
+        validate_wave_recovery(state)
+    validate_wave_recovery(candidate)
     validate_completion(contract, candidate, events)
     if requested_status == "COMPLETE":
         blockers = operational_blockers(contract, candidate, events)

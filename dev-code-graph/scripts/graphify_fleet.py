@@ -9,6 +9,9 @@ command, and is redacted from every error message.
 """
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
+import inspect
 import json
 import math
 import os
@@ -346,10 +349,144 @@ def request_chat(
 
 # ------------------------------------------------------- Graphify integration
 
-def register_graphify_backend() -> None:
-    import graphify.llm as graphify_llm
+def _call_shapes(repair: bool) -> Dict[str, Tuple[tuple, dict]]:
+    """Private Graphify call shapes this wrapper relies on."""
+    extract_kwargs = {
+        "backend": BACKEND_NAME, "api_key": None, "model": None,
+        "root": Path("."), "deep_mode": False,
+    }
+    calls: Dict[str, Tuple[tuple, dict]] = {
+        "extract_files_direct": (([],), extract_kwargs),
+        "_read_files": (([], Path(".")), {}),
+        "_extraction_system": ((), {"deep": False}),
+        "_parse_llm_json": (("{}",), {}),
+    }
+    if repair:
+        calls.update({
+            "_pack_chunks_by_tokens": (([],), {"token_budget": 12000}),
+            "_extract_with_adaptive_retry": (
+                ([],),
+                {"backend": BACKEND_NAME, "api_key": None, "model": None,
+                 "root": Path("."), "max_depth": 3},
+            ),
+        })
+    return calls
+
+
+def validate_graphify(
+    graphify_llm: Any, *, repair: bool = False, secret: Optional[str] = None
+) -> Dict[str, Any]:
+    """Check the private Graphify API before anything is patched.
+
+    Every function this wrapper calls must accept the exact call shape used
+    (inspect.signature + bind); variadic signatures cannot be verified and are
+    rejected.  Returns a provenance receipt (package version, credential-free
+    source URL, module sha256) and optionally publishes it to the path in
+    GRAPHIFY_COMPAT_RECEIPT.
+    """
+    signatures: Dict[str, Any] = {}
+    try:
+        if not isinstance(graphify_llm.BACKENDS, dict):
+            raise ValueError("BACKENDS is not a dictionary")
+        for name, (args, kwargs) in _call_shapes(repair).items():
+            function = getattr(graphify_llm, name)
+            if name == "extract_files_direct":
+                function = getattr(
+                    graphify_llm, "_fleet_original_extract_files_direct", function
+                )
+            signature = inspect.signature(function)
+            if any(
+                parameter.kind
+                in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for parameter in signature.parameters.values()
+            ):
+                raise ValueError(f"{name} has an unverifiable variadic signature")
+            signature.bind(*args, **kwargs)
+            signatures[name] = [
+                {"name": parameter.name, "kind": parameter.kind.name,
+                 "required": parameter.default is inspect.Parameter.empty}
+                for parameter in signature.parameters.values()
+            ]
+        packages = importlib.metadata.packages_distributions().get(
+            "graphify", ["graphify"]
+        )
+        if len(packages) != 1:
+            raise ValueError("graphify module has ambiguous package ownership")
+        distribution = importlib.metadata.distribution(packages[0])
+        version = distribution.version
+        if not version:
+            raise ValueError("package version is missing")
+        source_path = Path(graphify_llm.__file__).resolve()
+        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        direct = distribution.read_text("direct_url.json")
+        direct_url = json.loads(direct) if direct else {}
+        source = (
+            direct_url.get("url")
+            or distribution.metadata.get("Home-page")
+            or str(source_path)
+        )
+        parsed = urllib.parse.urlsplit(source)
+        if parsed.scheme:
+            # Strip credentials, query and fragment.
+            source = urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")
+            )
+    except (AttributeError, TypeError, ValueError, OSError,
+            importlib.metadata.PackageNotFoundError) as error:
+        raise BackendError(
+            "unsupported Graphify: compatibility validation failed "
+            f"({type(error).__name__})"
+        ) from None
+    receipt: Dict[str, Any] = {
+        "package": distribution.metadata.get("Name", "graphify"),
+        "version": version,
+        "source": source,
+        "module_path": str(source_path),
+        "module_sha256": source_hash,
+        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "signatures": signatures,
+        "operation_id": os.environ.get("GRAPHIFY_OPERATION_ID"),
+    }
+
+    def protect(value: Any) -> Any:
+        if isinstance(value, str):
+            return _redact(value, secret) if secret else value
+        if isinstance(value, list):
+            return [protect(item) for item in value]
+        if isinstance(value, dict):
+            return {key: protect(item) for key, item in value.items()}
+        return value
+
+    receipt = protect(receipt)
+    receipt_path = os.environ.get("GRAPHIFY_COMPAT_RECEIPT")
+    if receipt_path:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from fleet_index import atomic_write_json
+
+        try:
+            atomic_write_json(Path(receipt_path), receipt)
+        except OSError:
+            raise BackendError(
+                "unsupported Graphify: cannot publish compatibility receipt"
+            ) from None
+    return receipt
+
+
+def register_graphify_backend(*, repair: bool = False) -> None:
+    try:
+        import graphify.llm as graphify_llm
+    except ImportError as error:
+        raise BackendError("unsupported Graphify: graphify.llm is unavailable") from error
 
     config = BackendConfig.from_env()
+    receipt = validate_graphify(graphify_llm, repair=repair, secret=config.api_key)
+    print(
+        "graphify-fleet: Graphify provenance " + json.dumps(receipt, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
     graphify_llm.BACKENDS[BACKEND_NAME] = {
         "base_url": config.base_url,
         "default_model": config.model,
@@ -360,7 +497,12 @@ def register_graphify_backend() -> None:
         "temperature": 0,
         "max_tokens": config.max_tokens,
     }
-    original_extract = graphify_llm.extract_files_direct
+    # Idempotent: wrap the pristine function, never a previous wrapper.
+    original_extract = getattr(
+        graphify_llm,
+        "_fleet_original_extract_files_direct",
+        graphify_llm.extract_files_direct,
+    )
 
     def extract_files_direct(
         files: List[Path],

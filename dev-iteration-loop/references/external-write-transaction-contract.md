@@ -13,7 +13,9 @@ network or provider access.
    replay for the same operation, permits retry after authoritative absence,
    and exposes an authoritative read. Do not infer these guarantees from a
    client wrapper.
-3. Rotate both operation ID and retry key for a new logical operation. Reuse
+3. Derive idempotency keys from the intent plus the operation ID, never from a
+   time bucket, and make a success receipt attributable to the request that
+   produced it. Rotate both operation ID and retry key for a new logical operation. Reuse
    the operation ID, intent digest, and retry key for every retry of the same
    operation.
 4. Freeze the canonical authoritative query and its SHA-256. Before the first

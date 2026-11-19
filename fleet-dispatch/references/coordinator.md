@@ -43,6 +43,40 @@ Before classifying a stall, check the actual command, build, gate, or job
 receipts. A provider-accepted capacity wait is never a reason to steer,
 interrupt, relaunch, or downgrade.
 
+### Stall handling
+
+| Observation | Action |
+|---|---|
+| `blocked`, and the reason is on the card's "Not blockers" list | do not wait: one steer now quoting that line, telling the worker to set `in-progress` and finish what it can; the coordinator's own items go to `known_gaps` |
+| session waiting for input for more than 10 minutes, or an error right after a provider capacity failure | interrupt it, relaunch from the HANDOFF, and send one concrete steer naming the single next step |
+| uncommitted work older than 45 minutes with no push | one steer: commit and push the tested slice; independent review is scheduled by the coordinator |
+| session blocked on a decision that needs the human | `mark` stays as is; open the decision (tiered) |
+| provider capacity wait (queued, accepted) | not a stall: no steer, interrupt, relaunch, or tier change; wait for the dequeue |
+| the third steer need within 30 minutes | decision or re-slice, never a third steer |
+
+The steer queue guard (at most 2 per session per 30 minutes) applies to the
+coordinator's own thread as well: a coordinator that keeps being corrected has a
+wrong card or a wrong prompt, so re-slice or relaunch it from its HANDOFF
+instead of steering again.
+
+### Taking over a fleet (or a coordinator turn) safely
+
+Before claiming anything about the state of a running fleet, separate what you
+observed from what you assume:
+
+- a running watcher is not fresh observations: check the age of the overlay or
+  state file it writes, and treat a stale one as unknown;
+- an SSH snapshot (a one-off `status`, `ps`, or `tmux` capture) is not the event
+  loop and says nothing about events that arrived since;
+- a tmux label or window title is not execution: confirm the process, the
+  generation, and the log mtime behind it;
+- resolve the primary thread, generation, and role first; two sessions with the
+  same item id may be an old fenced generation and the live one;
+- missing telemetry is unknown, never "healthy" and never "stalled";
+- context compaction is not a capacity wait: a compacting session is making
+  progress or finishing a summary, not queueing at the provider, and must not be
+  confused with either a stall or a queue.
+
 ## Dispatch
 
 Dispatch only items the human scoped or whose dependencies just completed and

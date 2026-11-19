@@ -76,15 +76,43 @@ class LauncherTests(unittest.TestCase):
             (root / "repo-a" / ".git").mkdir(parents=True)
             (root / "nested" / "repo-b").mkdir(parents=True)
             (root / "nested" / "repo-b" / ".git").write_text("gitdir: elsewhere\n")
-            (root / "repo-a" / ".claude" / "worktrees" / "temporary" / ".git").mkdir(parents=True)
             (root / "repo-a" / "nested-generated" / ".git").mkdir(parents=True)
             (root / "runtime" / "data" / "workspaces" / "generated" / ".git").mkdir(parents=True)
             (root / "archive" / "raw" / "shards" / "generated" / ".git").mkdir(parents=True)
             (root / "ordinary" / "node_modules" / "ignored" / ".git").mkdir(parents=True)
-            self.assertEqual(
-                start_serena.discover_projects([root]),
-                [root / "nested" / "repo-b", root / "repo-a"],
-            )
+            (root / "ordinary" / "vendor" / "ignored" / ".git").mkdir(parents=True)
+            with patch.dict(os.environ, {"SERENA_DISCOVERY_EXCLUDES": json.dumps([
+                    "runtime/data/workspaces", "raw/shards"])}):
+                report = []
+                self.assertEqual(start_serena.discover_projects([root], report),
+                                 [root / "nested" / "repo-b", root / "repo-a"])
+                configured = [row for row in report if row["reason"].startswith("configured")]
+                self.assertEqual(len(configured), 2)
+                self.assertTrue(all({"path", "pattern", "reason"} <= set(row) for row in report))
+
+    def test_default_discovery_has_no_site_specific_excludes(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SERENA_DISCOVERY_EXCLUDES": "[]"}):
+            root = Path(directory).resolve()
+            names = ["workdir/repos/repo", "runtime/data/workspaces/repo",
+                     "raw/shards/repo", ".claude/worktrees/repo"]
+            for name in [*names, "tmp/ignored", ".cache/ignored", "a/__pycache__/ignored"]:
+                (root / name / ".git").mkdir(parents=True)
+            report = []
+            self.assertEqual(start_serena.discover_projects([root], report),
+                             sorted(root / name for name in names))
+            self.assertEqual({row["pattern"] for row in report if row["reason"] == "temporary directory"},
+                             {"tmp", ".cache", "__pycache__"})
+
+    def test_explicit_root_inside_excluded_name_is_still_scanned(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SERENA_DISCOVERY_EXCLUDES": "[]"}):
+            root = Path(directory).resolve() / "tmp"
+            (root / "repo" / ".git").mkdir(parents=True)
+            self.assertEqual(start_serena.discover_projects([root]), [root / "repo"])
+
+    def test_invalid_discovery_excludes_fail_closed(self):
+        for value in ('{}', '[1]', '["../repo"]', '["/repo"]', '[""]', 'not json', '["a/./b"]'):
+            with patch.dict(os.environ, {"SERENA_DISCOVERY_EXCLUDES": value}), self.assertRaises(ValueError):
+                start_serena.discover_projects([])
 
     def test_workspace_root_may_be_a_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -450,7 +478,7 @@ class LauncherTests(unittest.TestCase):
             with patch("start_serena.subprocess.run", return_value=listed):
                 self.assertEqual(start_serena.first_source_file(project, ["java"]), source)
 
-    def test_serena_gitwildmatch_handles_nested_directory_and_negation(self):
+    def test_serena_ignore_filter_handles_nested_directory_and_negation(self):
         binary = start_serena.shutil.which("serena")
         if binary is None:
             self.skipTest("Serena executable is unavailable")
@@ -964,6 +992,26 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn(f"  - {tool}\n", context)
             self.assertNotIn("  - execute_shell_command\n", context)
             self.assertNotIn("  - replace_symbol_body\n", context)
+
+    def test_check_reports_discovery_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "absent"
+            roots = Path(directory) / "roots"
+            (roots / "tmp" / "scratch" / ".git").mkdir(parents=True)
+            (roots / "app" / ".git").mkdir(parents=True)
+            env = {"SERENA_CODE_STATE_ROOT": str(state), "SERENA_CODE_ROOTS": str(roots)}
+            with patch.dict(os.environ, env):
+                with patch("start_serena.project_root", return_value=None):
+                    with patch("start_serena.shutil.which", return_value="/bin/tool"):
+                        with patch("start_serena.serena_cli_prefix", return_value=["/bin/python", "/bootstrap"]):
+                            with patch("start_serena.runtime_identity", return_value={"key": "v1-test"}):
+                                with patch("sys.argv", ["start_serena.py", "--check"]):
+                                    with patch("builtins.print") as output:
+                                        start_serena.main()
+            document = json.loads(output.call_args.args[0])
+            self.assertEqual(document["discovered_projects"], 1)
+            self.assertIn({"path": str(roots / "tmp"), "pattern": "tmp", "reason": "temporary directory"},
+                          document["discovery_exclusions"])
 
     def test_check_has_no_state_writes(self):
         with tempfile.TemporaryDirectory() as directory:

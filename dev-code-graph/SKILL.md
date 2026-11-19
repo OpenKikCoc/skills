@@ -63,6 +63,15 @@ scripts/graphify-fleet fleet audit  --root <fleet-root> --output <out> \
   fragment, and `merge` combines base graphs and fragments.
 - Builds are resumable: `success` and `repaired` targets are skipped unless
   `--force`. The disk floor is checked before every target launch.
+- Each target runs under a deadline (`--target-timeout`, default 3600 s, and
+  `--kill-grace`, default 2 s) in its own process group; on expiry only that
+  group is stopped and the target is `timed_out`, never auto-relaunched. Start
+  and terminal receipts per phase live in `status/`; a start-only receipt means
+  the outcome is unknown. One coordinator per output root. Any status other than
+  `success` or `repaired` is a failure.
+- `repair` runs in a bounded worker and its result is verified against the
+  operation id and fragment counts. Graphify's private API is signature-checked
+  before anything is patched (`unsupported Graphify` otherwise).
 - Do not call a fleet complete until `audit` passes.
 
 Read [fleet-indexing.md](references/fleet-indexing.md) before a large run or
@@ -86,4 +95,4 @@ python3 -I scripts/test_graphify_fleet.py
 python3 -I scripts/test_fleet_index.py
 ```
 
-Both use stubs (loopback HTTP server, fake Graphify launcher); no network.
+All use stubs (loopback HTTP server, fake Graphify launcher); no network.

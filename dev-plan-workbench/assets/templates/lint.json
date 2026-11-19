@@ -1,0 +1,9 @@
+{
+  "banned_terms": [{"term": "north star", "reason": "Translate the instruction into a reader-visible priority, not a slogan."}],
+  "person_names": [],
+  "forbid_first_person": ["we", "our", "I"],
+  "required_links": [],
+  "max_sentence_chars": 160,
+  "max_enumeration_marks": 6,
+  "max_heading_depth": 4
+}

@@ -9,6 +9,13 @@ pending/blocked gaps instead of waiting for every lane. Lanes worth separating:
 live object state, controller/component logs, node-side evidence, source and
 version, recent changes.
 
+## Conclusion first
+
+The answer opens with the root-cause statement and confidence defined in
+[conclusion-contract.md](conclusion-contract.md), which also fixes the answer
+shape (root cause, evidence chain, excluded, remedy, follow-ups) and the
+self-check. The structure below is the working record behind it.
+
 ## Structure
 
 1. **Impact and timeline** - UTC, with source for each key transition.

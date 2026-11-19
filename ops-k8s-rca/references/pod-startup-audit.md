@@ -71,7 +71,7 @@ host or pod IP is present.
   read `node_concentration` in the output.
 - `context canceled` can come from workload deletion; it does not alone prove a
   runtime outage.
-- Binder success disproves "unscheduled" but does not prove kubelet success.
+- Successful binding disproves "unscheduled" but does not prove kubelet success.
 - A Ready node can still have a blocked kubelet or runtime.
 - A large Pending count can be healthy churn (short-lived batch/serverless
   Pods); look at persistence and age distribution first.
@@ -91,3 +91,5 @@ UTC window and exact target coverage; per-cluster first/second Pending counts;
 persistent counts by class; candidate age, node and events; node concentration;
 historical orphans and unscheduled Pods in separate sections; access, timeout,
 retention and namespace coverage gaps; next discriminating host checks.
+
+See also [pending-pod-drilldown.md](pending-pod-drilldown.md) for the layer map keyed by the last stage the exact UID reached.

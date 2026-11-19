@@ -55,9 +55,14 @@ bounded fallback below; do not keep probing the same unchanged state.
   `SERENA_CODE_ROOTS` (default `~/src`; set it to wherever your checkouts
   live, e.g. `SERENA_CODE_ROOTS=~/src:~/work`). A root that is itself a Git
   repository is terminal; list nested repositories as separate roots when needed.
-  Only selected projects enter the private connection registry. Ephemeral
-  worktrees (for example `.claude/worktrees`), `vendor` and `node_modules` are
-  excluded.
+  Only selected projects enter the private connection registry. Discovery skips
+  `tmp`, `.tmp`, `.cache`, `__pycache__`, `.git`, `vendor`, and `node_modules`
+  below each root; an explicit root is always scanned even if its own path
+  contains one of those names. Add more with `SERENA_DISCOVERY_EXCLUDES`, a JSON
+  list of relative directory paths (for example `["build/out", "scratch"]`);
+  absolute, `..`, empty, or non-JSON values are rejected. `--check` and
+  `--discover` report every exclusion as `discovery_exclusions` (path, pattern,
+  reason).
 
 ## Navigate by Symbol
 
@@ -177,7 +182,7 @@ without starting MCP. Use `--warm [PROJECT ...]` to build document-symbol caches
 `--doctor [PROJECT ...]` to run one real language-server symbol query per target.
 Doctor chooses a tracked source that matches the normalized project languages and
 skips paths covered by the normalized `ignored_paths` configuration using Serena's
-GitWildMatch implementation. Unknown configured language IDs fall back to the
+gitignore-style matcher. Unknown configured language IDs fall back to the
 launcher's broad supported-source suffix set instead of producing no candidate.
 Omitting project selectors targets every discovered stable repository, so prefer
 an explicit bounded list for routine warming and diagnosis. Duplicate directory

@@ -47,7 +47,7 @@ DEFAULTS = {
     "limits": {"max_active": 4, "max_active_per_repo": 2, "steers_per_window": 2,
                "steer_window_minutes": 30, "stale_fraction_of_timebox": 0.5,
                "supervisor_offline_after_minutes": 120, "push_timeout_s": 120},
-    "notify": {}, "runtimes": {},
+    "notify": {}, "runtimes": {}, "model_tiers": {},
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, card_path TEXT, card_sha256 TEXT, repo TEXT,
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, item TEXT, tier TEXT, 
 CREATE TABLE IF NOT EXISTS heartbeats(role TEXT PRIMARY KEY, ts TEXT);
 CREATE TABLE IF NOT EXISTS host_jobs(id TEXT PRIMARY KEY, item TEXT, host TEXT, state TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS wakes(key TEXT PRIMARY KEY, ts TEXT);
+CREATE TABLE IF NOT EXISTS completions(item TEXT, kind TEXT, phase TEXT, ts TEXT, detail TEXT);
 """
 
 S = types.SimpleNamespace(home=None, cfg=None, db=None, config_path=None)
@@ -129,6 +130,15 @@ def out(args, data, text=None):
               else json.dumps(data, indent=2, sort_keys=True))
 
 
+def no_duplicate_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate key %r" % k)
+        d[k] = v
+    return d
+
+
 def setup(args):
     S.db = None
     env_home = os.environ.get("FLEET_HOME")
@@ -138,7 +148,7 @@ def setup(args):
     if os.path.exists(path):
         try:
             with open(path) as f:
-                cfg = deep_merge(DEFAULTS, json.load(f))
+                cfg = deep_merge(DEFAULTS, json.load(f, object_pairs_hook=no_duplicate_keys))
         except (OSError, ValueError) as e:
             raise Fail("cannot read config %s: %s" % (path, e))
     S.cfg, S.config_path = cfg, path
@@ -152,6 +162,7 @@ def db():
             raise Fail("fleet not initialised at %s (run: fleet.py init)" % S.home)
         S.db = sqlite3.connect(p, timeout=30, isolation_level=None)
         S.db.row_factory = sqlite3.Row
+        S.db.execute("CREATE TABLE IF NOT EXISTS completions(item TEXT, kind TEXT, phase TEXT, ts TEXT, detail TEXT)")
     return S.db
 
 
@@ -279,6 +290,12 @@ def lint_card(text):
             e.append("effort must be one of %s" % "|".join(TIERS))
         if not fm.get("effort_reason"):
             e.append("effort override requires effort_reason")
+    if "tier" in fm and not fm["tier"]:
+        e.append("tier is empty (omit the key or name an approved tier)")
+    if fm.get("tier") and fm.get("effort"):
+        e.append("tier and effort are mutually exclusive")
+    if fm.get("reviewer_tier") and not fm.get("tier"):
+        e.append("reviewer_tier needs tier")
     if fm.get("repo") and fm["repo"] != "-" and "{{" not in fm["repo"]:
         if not fm.get("base"):
             e.append("code card (repo != '-') requires base")
@@ -359,6 +376,50 @@ def resolve_tier(rtname, tier):
             "model": t.get("model") or rt.get("default_model", ""), "effort": t.get("effort", eff)}
 
 
+def approved_tiers():
+    """Validated config `model_tiers`: name -> {model, effort, reviewer?}. Anything off fails closed."""
+    mt = S.cfg.get("model_tiers")
+    if not isinstance(mt, dict) or not mt:
+        raise Fail("a tier was requested but the config has no model_tiers (fail closed)")
+    seen = {}
+    for name, t in mt.items():
+        if not isinstance(name, str) or not name.strip() or name in TIERS:
+            raise Fail("model_tiers: invalid tier name %r (empty or a canonical effort tier)" % (name,))
+        if not isinstance(t, dict):
+            raise Fail("model_tiers[%s]: must be an object" % name)
+        for k in ("model", "effort"):
+            if not isinstance(t.get(k), str) or not t[k].strip():
+                raise Fail("model_tiers[%s]: missing or empty %s" % (name, k))
+        extra = sorted(set(t) - {"model", "effort", "reviewer"})
+        if extra:
+            raise Fail("model_tiers[%s]: unknown keys %s" % (name, extra))
+        key = (t["model"], t["effort"])
+        if key in seen:
+            raise Fail("model_tiers: duplicate (model, effort) tuple in %s and %s" % (seen[key], name))
+        seen[key] = name
+    for name, t in mt.items():
+        if t.get("reviewer") is not None and t["reviewer"] not in mt:
+            raise Fail("model_tiers[%s]: reviewer %r is not an approved tier" % (name, t["reviewer"]))
+    return mt
+
+
+def resolve_model_tier(name):
+    mt = approved_tiers()
+    if name not in mt:
+        raise Fail("unknown tier %r (approved: %s)" % (name, ", ".join(sorted(mt))))
+    return {"tier": name, "effective_tier": name, "clamped": False, "clamp_direction": None,
+            "model": mt[name]["model"], "effort": mt[name]["effort"]}
+
+
+def resolve_any_tier(rtname, tier):
+    """An explicit tier: an approved (model, effort) name when configured, else a canonical effort tier."""
+    if S.cfg.get("model_tiers") and tier not in TIERS:
+        return resolve_model_tier(tier)
+    if tier not in TIERS:
+        raise Fail("unknown tier %r" % tier)
+    return resolve_tier(rtname, tier)
+
+
 def route_card(fm):
     cfg = S.cfg["routing"]
     sig = {k: fm.get(k) or SIGNAL_DEFAULT[k] for k in SIGNALS}
@@ -385,6 +446,17 @@ def route_card(fm):
         rev = tier_at_least(rev, cfg["reviewer_min_when_risky"])
         reasons.append("reviewer: risk>=medium -> at least %s" % cfg["reviewer_min_when_risky"])
     rt = fm["runtime"]
+    if fm.get("tier"):
+        mt = approved_tiers()
+        worker = resolve_model_tier(fm["tier"])
+        rname = fm.get("reviewer_tier") or mt[fm["tier"]].get("reviewer")
+        if not rname:
+            raise Fail("tier %s has no reviewer tier: set reviewer_tier on the card or reviewer in model_tiers"
+                       % fm["tier"])
+        reasons.append("approved tier %s -> %s/%s; reviewer tier %s" % (
+            fm["tier"], worker["model"], worker["effort"], rname))
+        return {"item": fm["id"], "signals": sig, "score": score, "computed_tier": tier, "override": None,
+                "tier": fm["tier"], "reasons": reasons, "worker": worker, "reviewer": resolve_model_tier(rname)}
     return {"item": fm["id"], "signals": sig, "score": score, "computed_tier": tier, "override": override,
             "tier": final, "reasons": reasons, "worker": resolve_tier(rt, final),
             "reviewer": resolve_tier(rt, rev)}
@@ -634,6 +706,83 @@ def exclude_handoff(wd):
             f.write(("" if cur.endswith("\n") or not cur else "\n") + "HANDOFF.md\n")
 
 
+RELAY_MAX = 12000
+RELAY_READ = 512 * 1024
+REDACTIONS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)([?&][a-z0-9_.-]*(?:token|key|secret|passw(?:or)?d|signature|sig|credential)[a-z0-9_.-]*=)[^&\s'\"]+"),
+     r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b([a-z0-9_]*(?:token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|credential|capability)"
+                r"[a-z0-9_]*)(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\"']+)"), r"\1\2[REDACTED]"),
+    (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|github_pat|xox[bap]|AKIA)[-_A-Za-z0-9]{12,}"), "[REDACTED]"),
+    (re.compile(r"(?![0-9a-f]{40}\b)(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[A-Za-z])[A-Za-z0-9+/_-]{40,}"), "[REDACTED]"),
+]
+
+
+def redact(s):
+    for rx, sub in REDACTIONS:
+        s = rx.sub(sub, s)
+    return s
+
+
+def turn_text(o):
+    """Flatten one JSON log record into the text a person would read: messages and tool calls."""
+    parts = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            if isinstance(v.get("text"), str):
+                parts.append(v["text"])
+            cmd = v.get("command") or v.get("cmd")
+            if isinstance(cmd, (str, list)):
+                parts.append("tool: %s" % (cmd if isinstance(cmd, str) else " ".join(map(str, cmd))))
+            elif v.get("type") == "tool_use" and v.get("name"):
+                parts.append("tool %s: %s" % (v["name"], json.dumps(v.get("input", {}), sort_keys=True)[:300]))
+            for k, c in v.items():
+                if isinstance(c, (dict, list)) and k != "input":
+                    walk(c)
+        elif isinstance(v, list):
+            for c in v:
+                walk(c)
+
+    walk(o)
+    return "[%s] %s" % (o.get("type") or "event", " | ".join(parts)) if parts else ""
+
+
+def relay_context(prev, wd, base):
+    """Bounded, redacted tail of the previous generation's log plus a diff stat. Empty when the log is missing."""
+    try:
+        size = os.path.getsize(prev["log_path"])
+        with open(prev["log_path"], "rb") as f:
+            if size > RELAY_READ:
+                f.seek(size - RELAY_READ)
+                f.readline()
+            raw = f.read().decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return ""
+    lines = []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if ln.startswith("{"):
+            try:
+                ln = turn_text(json.loads(ln))
+            except (ValueError, AttributeError):
+                pass
+        if ln:
+            lines.append(ln)
+    stat = ""
+    if wd and base and os.path.isdir(wd):
+        r = run_git(wd, "diff", "--stat", "origin/" + base, timeout=60)
+        if r.returncode == 0 and r.stdout.strip():
+            stat = "Diff stat vs origin/%s:\n%s\n" % (base, redact(r.stdout.strip())[:2000])
+    head = ("\nContext relay from the previous generation (read-only hints, redacted, possibly incomplete; "
+            "the HANDOFF is the only authority):\n")
+    body = redact("\n".join(lines)).replace("@@GEN@@", "")
+    room = RELAY_MAX - len(head) - len(stat) - len("Log tail:\n") - 1
+    return head + stat + "Log tail:\n" + body[-room:] + "\n"
+
+
 def launch_prompt(role, item, handoff, wd, extra=""):
     base = ("You are the %s for fleet item %s (generation @@GEN@@).\n"
             "The HANDOFF is your only task input: %s\n"
@@ -656,22 +805,38 @@ def launch_core(card, role, dry, tier=None, replace=False, reason=""):
     if not rt:
         raise Fail("unknown runtime %r" % rtname)
     routed = route_card(fm)
+    if tier and role == "coordinator":
+        raise Fail("--tier does not apply to the coordinator; its effort comes from config")
     if role == "worker":
-        res = resolve_tier(rtname, tier) if tier else routed["worker"]
+        res = resolve_any_tier(rtname, tier) if tier else routed["worker"]
     elif role == "reviewer":
-        res = routed["reviewer"]
+        res = resolve_any_tier(rtname, tier) if tier else routed["reviewer"]
     else:
         res = resolve_tier(rtname, S.cfg["coordinator"]["effort"])
     chash = contract_hash(text)
     it = None
     if os.path.exists(os.path.join(S.home, "fleet.db")):
         it = q1("SELECT * FROM items WHERE id=?", info["id"])
+    prev, tuple_changed = None, False
     if it:
         if it["card_sha256"] != chash:
             raise Fail("card contract differs from the registered one; a changed contract needs a new item")
         if it["state"] in TERMINAL:
             raise Fail("item is %s; reopening needs a new card" % it["state"])
+        if info["code"] and it["branch"]:
+            info["branch"] = it["branch"]  # the registry owns the branch (a rework rename is rebound there)
         prev = current_gen(it["id"], role)
+        if prev and role in ("worker", "reviewer") and not tier and prev["model"] is not None:
+            # a relaunch without an explicit tier keeps the registered tuple exactly
+            res = {"tier": prev["tier"], "effective_tier": prev["tier"], "clamped": False, "clamp_direction": None,
+                   "model": prev["model"], "effort": prev["effort"]}
+        if prev and role == "coordinator" and (prev["runtime"], prev["model"], prev["effort"]) != (
+                rtname, res["model"], res["effort"]):
+            tuple_changed = True
+            if alive(prev["pid"]):
+                raise Fail("a coordinator effort/runtime change needs an idle coordinator")
+            if not os.path.exists(os.path.join(S.home, "work", info["slug"], "HANDOFF.md")):
+                raise Fail("a coordinator effort/runtime change needs a fresh generation started from its HANDOFF; none found")
         if prev and not prev["fenced"] and alive(prev["pid"]) and not replace:
             raise Fail("a live %s generation already exists (g%d); use escalate to replace it" % (role, prev["gen"]))
     if role == "worker":
@@ -731,8 +896,13 @@ def launch_core(card, role, dry, tier=None, replace=False, reason=""):
                 f.write(text)
         if info["code"] and role == "worker":
             exclude_handoff(wd)
+    if prev:
+        extra += relay_context(prev, wd if role != "coordinator" else None, info["base"] if info["code"] else None)
     prompt = launch_prompt(role, info["id"], hp, wd, extra)
     r = start_gen(it, role, rtname, res, wd, branch, prompt, res["tier"], None, False)
+    if tuple_changed:
+        emit(info["id"], "coordinator:tuple_changed", gen=r["gen"], effort=res["effort"], model=res["model"],
+             runtime=rtname)
     state = {"worker": "in-progress", "reviewer": "in-review", "coordinator": it["state"]}[role]
     if role == "coordinator" and it["state"] == "queued":
         state = "in-progress"
@@ -748,7 +918,7 @@ def launch_core(card, role, dry, tier=None, replace=False, reason=""):
 def cmd_launch(args):
     if not args.dry_run:
         actor(args, {"human"} if args.role == "coordinator" else {"coordinator", "human"})
-    plan = launch_core(args.card, args.role, args.dry_run)
+    plan = launch_core(args.card, args.role, args.dry_run, tier=args.tier)
     out(args, dict(plan, dry_run=args.dry_run),
         "%s %s g%s tier=%s effort=%s\n  workdir: %s\n  argv: %s" % (
             "would launch" if args.dry_run else "launched", plan["role"], plan["gen"], plan["tier"],
@@ -757,6 +927,16 @@ def cmd_launch(args):
 
 
 # ---------------------------------------------------------------- verify / review / land
+
+def adds_nothing(repo, base, sha):
+    """True when the candidate contributes nothing to origin/<base>: an ancestor, or every commit has a
+    patch-equivalent already there (all `git cherry` marks are '-')."""
+    if run_git(repo, "merge-base", "--is-ancestor", sha, "origin/" + base).returncode == 0:
+        return True
+    r = run_git(repo, "cherry", "origin/" + base, sha)
+    marks = [ln[:1] for ln in r.stdout.splitlines() if ln.strip()] if r.returncode == 0 else []
+    return bool(marks) and all(m == "-" for m in marks)
+
 
 def check_manifest(man, item, wd):
     f = []
@@ -863,7 +1043,10 @@ def run_verify(itemid):
             if r.returncode != 0:
                 f.append("candidate %s not found locally" % sha[:12])
             elif r.stdout.strip() != "1":
-                f.append("candidate must be exactly one commit above origin/%s (found %s)" % (it["base"], r.stdout.strip()))
+                if adds_nothing(it["repo"], it["base"], sha):
+                    res["already_integrated"] = True  # nothing to land; complete-verified handles it
+                else:
+                    f.append("candidate must be exactly one commit above origin/%s (found %s)" % (it["base"], r.stdout.strip()))
             else:
                 mb = run_git(it["repo"], "merge-base", "origin/" + it["base"], sha).stdout.strip()
                 par = run_git(it["repo"], "rev-parse", sha + "^").stdout.strip()
@@ -964,6 +1147,8 @@ def cmd_land(args):
     g = run_git(it["repo"], "fetch", "origin", timeout=120)
     if g.returncode != 0:
         refuse("fetch failed: " + g.stderr.strip())
+    if adds_nothing(it["repo"], it["base"], sha):
+        refuse("the candidate adds nothing to origin/%s: close it with complete-verified --kind already-integrated" % it["base"])
     if run_git(it["repo"], "merge-base", "--is-ancestor", "origin/" + it["base"], sha).returncode != 0:
         refuse("not a fast-forward: origin/%s moved; rework to rebase, then re-verify and re-review" % it["base"])
     land_record(args.item, sha, "pushing")
@@ -1003,11 +1188,122 @@ def cmd_mark(args):
     else:
         if role not in ("coordinator", "human"):
             raise Fail("denied: %s needs coordinator capability or --human" % st, 3)
+        if st == "done" and it["repo"] == "-":
+            raise Fail("a non-code card completes through complete-verified --kind noncode, not mark")
         if st == "done" and it["repo"] != "-" and it["state"] != "landed":
             raise Fail("a code card must be landed before done")
     x("UPDATE items SET state=?, updated=? WHERE id=?", st, now(), args.item)
     emit(args.item, "mark:" + st, by=role)
     out(args, {"item": args.item, "state": st}, "%s -> %s" % (args.item, st))
+    return 0
+
+
+def no_symlink(wd, rel):
+    cur = wd
+    for part in os.path.normpath(rel).split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return False
+    return True
+
+
+def verdict_basis(itemid, kind, v, candidate, coordinator_verdict):
+    """Return (basis string, review rowid or None). Raises Fail when no acceptable verdict exists."""
+    rows = q("SELECT rowid r, * FROM reviews WHERE item=? ORDER BY rowid", itemid)
+    if coordinator_verdict is not None:
+        if kind != "noncode":
+            raise Fail("a coordinator verdict is accepted only for --kind noncode")
+        if rows:
+            raise Fail("a reviewer verdict exists for this item; a coordinator verdict is allowed only when none does")
+        if not coordinator_verdict.strip() or "\n" in coordinator_verdict.strip():
+            raise Fail("--coordinator-verdict must be one non-empty line")
+        return "coordinator_verdict", None
+    mine = [r for r in rows if r["manifest_sha256"] == v["manifest_sha256"] and (kind == "noncode" or r["candidate_sha"] == candidate)]
+    if not mine:
+        raise Fail("needs a reviewer PASS bound to the current manifest%s (or, for noncode with no reviewer verdict, "
+                   "a --coordinator-verdict)" % ("" if kind == "noncode" else " and candidate"))
+    last = mine[-1]
+    if last["verdict"] != "PASS":
+        raise Fail("the latest reviewer verdict is %s; needs a reviewer PASS" % last["verdict"])
+    refresh_sessions()
+    rg = q1("SELECT * FROM generations WHERE item=? AND gen=?", itemid, last["reviewer_gen"])
+    workers = {g["session_id"] for g in q("SELECT session_id FROM generations WHERE item=? AND role='worker'", itemid)
+               if g["session_id"]}
+    if not rg or rg["role"] != "reviewer":
+        raise Fail("the PASS was not recorded by a reviewer generation")
+    if rg["session_id"] and rg["session_id"] in workers:
+        raise Fail("the reviewer ran in the same session as the worker")
+    return "reviewer_pass:%d" % last["r"], last["r"]
+
+
+def cmd_complete_verified(args):
+    role, _ = actor(args, {"coordinator", "human"})
+    it = get_item(args.item)
+    last = q1("SELECT * FROM completions WHERE item=? ORDER BY rowid DESC LIMIT 1", args.item)
+    unknown = bool(last and last["phase"] in ("intent", "result_unknown"))
+    if args.reconcile:
+        if not unknown:
+            raise Fail("nothing to reconcile")
+        phase = "complete" if it["state"] == "done" else "not_completed"
+        x("INSERT INTO completions VALUES(?,?,?,?,?)", args.item, last["kind"], phase, now(), "reconcile")
+        out(args, {"item": args.item, "reconciled": phase}, "reconciled: %s" % phase)
+        return 0
+    if unknown:
+        raise Fail("the previous completion outcome is unknown; run complete-verified --reconcile (inspects state only)", 5)
+    if last and last["phase"] == "complete":
+        if last["kind"] != args.kind:
+            raise Fail("already completed as %s" % last["kind"])
+        out(args, {"item": args.item, "kind": args.kind, "completed": True, "noop": True}, "already completed (no-op)")
+        return 0
+    if it["state"] not in LIVE_STATES:
+        raise Fail("item is %s; only a live item can be completed" % it["state"])
+    code = it["repo"] != "-"
+    if args.kind == "noncode" and code:
+        raise Fail("--kind noncode applies to non-code cards only (this card has a repo)")
+    if args.kind == "already-integrated" and not code:
+        raise Fail("--kind already-integrated applies to code cards only")
+    v = run_verify(args.item)
+    if not v["ok"]:
+        raise Fail("verify failed:\n  " + "\n  ".join(v["failures"]))
+    candidate = None
+    if args.kind == "noncode":
+        wd = os.path.realpath(workdir(args.item))
+        _, text = read_handoff(args.item)
+        ev = read_manifest(text)["evidence"]
+        for e in ev:
+            if e.get("path") and not no_symlink(wd, e["path"]):
+                raise Fail("evidence path goes through a symlink: %s" % e["path"])
+        if not any(e.get("kind") in ("artifact", "report") and e.get("path") for e in ev):
+            raise Fail("a non-code completion needs at least one artifact or report with a path")
+    else:
+        candidate = args.candidate_sha
+        if not candidate or not SHA1.match(candidate):
+            raise Fail("--candidate-sha must be a full 40-hex sha")
+        if candidate != v["candidate_sha"]:
+            raise Fail("--candidate-sha differs from the manifest commit %s" % v["candidate_sha"])
+        if not adds_nothing(it["repo"], it["base"], candidate):
+            raise Fail("the candidate adds changes to origin/%s: land it instead" % it["base"])
+    basis, review_id = verdict_basis(args.item, args.kind, v, candidate, args.coordinator_verdict)
+    intent = {"item": args.item, "kind": args.kind, "manifest_sha256": v["manifest_sha256"], "candidate": candidate,
+              "basis": basis, "coordinator_verdict": args.coordinator_verdict}
+    digest = sha256_bytes(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())
+    res = {"item": args.item, "kind": args.kind, "basis": basis, "intent_sha256": digest, "noop": False}
+    if args.dry_run:
+        out(args, dict(res, dry_run=True, would_complete=True), "dry run: would complete (%s)" % basis)
+        return 0
+    x("INSERT INTO completions VALUES(?,?,?,?,?)", args.item, args.kind, "intent", now(), json.dumps(intent, sort_keys=True))
+    try:
+        x("UPDATE items SET state='done', updated=? WHERE id=?", now(), args.item)
+        emit(args.item, "complete-verified", completion=args.kind, basis=basis, intent_sha256=digest, by=role)
+        x("INSERT INTO completions VALUES(?,?,?,?,?)", args.item, args.kind, "complete", now(), digest)
+    except Exception as e:  # the effect may or may not have happened: terminal until reconciled
+        try:
+            x("INSERT INTO completions VALUES(?,?,?,?,?)", args.item, args.kind, "result_unknown", now(), repr(e))
+        except Exception:
+            pass
+        print("error: completion result unknown (%s); run complete-verified --reconcile" % type(e).__name__, file=sys.stderr)
+        return 5
+    out(args, dict(res, completed=True, dry_run=False), "completed %s (%s, %s)" % (args.item, args.kind, basis))
     return 0
 
 
@@ -1110,6 +1406,8 @@ def cmd_escalate(args):
     actor(args, {"coordinator", "human"})
     it = get_item(args.item)
     g = worker_gen_for_resume(args.item)
+    if g["tier"] in (S.cfg.get("model_tiers") or {}):
+        raise Fail("worker runs an approved tier (%s): change it with launch --tier, not escalate" % g["tier"])
     if g["tier"] not in TIERS[:4]:
         raise Fail("already at %s: split the card or open a human decision for max" % g["tier"])
     nxt = TIERS[TIERS.index(g["tier"]) + 1]
@@ -1126,6 +1424,26 @@ def cmd_escalate(args):
 
 # ---------------------------------------------------------------- preflight
 
+def rebind_branch(g, cur):
+    """A rework rename (<registered stem>-rN) of the card's own branch is rebound in the registry, with an audit event."""
+    stem = re.sub(r"-r\d+$", "", g["branch"])
+    if not re.fullmatch(re.escape(stem) + r"-r[1-9]\d*", cur):
+        return False
+    x("BEGIN IMMEDIATE")
+    try:
+        n = x("UPDATE items SET branch=?, updated=? WHERE id=? AND branch=?", cur, now(), g["item"], g["branch"]).rowcount
+        if n != 1:
+            x("ROLLBACK")
+            return False
+        x("UPDATE generations SET branch=? WHERE item=? AND branch=?", cur, g["item"], g["branch"])
+        emit(g["item"], "branch:rebound", **{"from": g["branch"], "to": cur, "gen": g["gen"]})
+        x("COMMIT")
+    except Exception:
+        x("ROLLBACK")
+        raise
+    return True
+
+
 def cmd_preflight(args):
     e = os.environ
     reason = None
@@ -1141,8 +1459,9 @@ def cmd_preflight(args):
             reason = "target is outside the bound worktree"
         elif args.action in ("commit", "build") and g["branch"]:
             r = run_git(root, "rev-parse", "--abbrev-ref", "HEAD")
-            if r.returncode != 0 or r.stdout.strip() != g["branch"]:
-                reason = "worktree is on branch %r, registered %r" % (r.stdout.strip(), g["branch"])
+            cur = r.stdout.strip()
+            if r.returncode != 0 or (cur != g["branch"] and not rebind_branch(g, cur)):
+                reason = "worktree is on branch %r, registered %r" % (cur, g["branch"])
     ok = reason is None
     res = {"allowed": ok, "reason": "ok" if ok else reason,
            "permitted_actions": ["edit", "commit", "build"] if ok else
@@ -1516,7 +1835,7 @@ def build_parser():
     cmd("route", cmd_route, "compute tier/model/effort for a card", A("card"))
     cmd("launch", cmd_launch, "start a worker/reviewer/coordinator generation", A("card"),
         A("--role", choices=["worker", "reviewer", "coordinator"], default="worker"),
-        A("--dry-run", action="store_true"))
+        A("--dry-run", action="store_true"), A("--tier", help="explicit tier: an approved model_tiers name or an effort tier"))
     cmd("status", cmd_status, "show items, HANDOFF state and sessions", A("item", nargs="?"))
     cmd("mark", cmd_mark, "set item state (capability-gated)", A("item"), A("state"))
     cmd("preflight", cmd_preflight, "gate a worker mutation", A("--action", choices=["edit", "commit", "build"], required=True),
@@ -1532,6 +1851,9 @@ def build_parser():
         A("--manifest-sha256", required=True), A("--notes-file"))
     cmd("land", cmd_land, "ff-only push of the reviewed SHA", A("item"), A("--sha", required=True),
         A("--reconcile", action="store_true"))
+    cmd("complete-verified", cmd_complete_verified, "close a finished non-code card or an already-integrated candidate",
+        A("item"), A("--kind", required=True, choices=["noncode", "already-integrated"]), A("--candidate-sha"),
+        A("--coordinator-verdict"), A("--dry-run", action="store_true"), A("--reconcile", action="store_true"))
     cmd("decide-open", cmd_decide_open, "open a tiered decision", A("item"),
         A("--tier", required=True, choices=["self", "notify", "human_required"]), A("--question", required=True),
         A("--options"), A("--default"), A("--deadline"))

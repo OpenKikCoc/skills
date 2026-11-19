@@ -127,7 +127,7 @@ def patch_project_resolution() -> None:
     SerenaConfig._code_intelligence_private_state_patch = True
 
 
-def filter_gitwildmatch_paths(paths: object, patterns: object) -> list[str]:
+def filter_ignored_paths(paths: object, patterns: object) -> list[str]:
     from pathspec.patterns import GitWildMatchPattern
 
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
@@ -153,7 +153,7 @@ def main() -> int:
         return 0
     if len(sys.argv) == 2 and sys.argv[1] == "isolation-filter-paths":
         request = json.load(sys.stdin)
-        print(json.dumps({"paths": filter_gitwildmatch_paths(request.get("paths"), request.get("patterns"))}))
+        print(json.dumps({"paths": filter_ignored_paths(request.get("paths"), request.get("patterns"))}))
         return 0
     from serena.cli import top_level
 

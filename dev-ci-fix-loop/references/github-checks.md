@@ -120,17 +120,25 @@ the results into this packet first:
 }
 ```
 
-- `expected_sha`: the PR `headRefOid` / MR source SHA.
-- `expected_required_checks`: names from the independently resolved policy,
-  not copied from whatever checks happened to run.
+### Input fields
+
+- `expected_sha`: required non-empty string; the PR `headRefOid` / MR source
+  SHA, not a branch name. Checks match it by exact equality.
+- `expected_required_checks`: required array of distinct non-empty names from
+  the independently resolved policy, never copied from the checks that
+  happened to run. An empty array does not turn optional-only or empty
+  results green.
 - `commit_checks`: checks from the commit-scoped query; `mr_checks`: the PR/MR
-  aggregate (`statusCheckRollup`). Leave `commit_checks` empty to fall back.
-- Per check: `name`, `required` (boolean), `sha`, `status`, `conclusion`.
-  GitHub check runs map `status`/`conclusion` directly; commit statuses map
-  `state` to `status`. Rollup entries carry no SHA, so set `sha` to the
-  `headRefOid` read in the same query. Optional `id`, `job_run_id`, `run_seq`,
-  `artifacts[]` (`name`, `available`, `locator`), `steps[]` (`id`, `name`,
-  `status`, `conclusion`, `log_available`), and `check_log_available`.
+  aggregate (`statusCheckRollup`). Both default to empty; leave
+  `commit_checks` empty to fall back.
+- Per check: `name` (non-empty), `required` (boolean), `sha`, `status`,
+  `conclusion`. GitHub check runs map `status`/`conclusion` directly; commit
+  statuses map `state` to `status`. Rollup entries carry no SHA, so set `sha`
+  to the `headRefOid` read in the same query. A missing SHA is unknown.
+  Optional `id`, `job_run_id`, `run_seq`, `artifacts[]` (`name`, `available`,
+  `locator`), `steps[]` (`id`, `name`, `status`, `conclusion`,
+  `log_available`), and `check_log_available`. Availability flags must
+  reflect observed evidence.
 
 `status` accepts queued, pending, waiting, running, in_progress, completed,
 success, pass, failure, fail, cancelled, timed_out, and related spellings.
@@ -142,6 +150,33 @@ For a failed check the evaluator selects, in order: the first available
 artifact, the first failed step with `log_available: true`, `check_log` when
 `check_log_available: true`, otherwise `none`. This is advisory; prove the
 chosen evidence can actually be retrieved.
+
+### Invocation and output
+
+Import `evaluate(packet)` for a pure in-process result (`EvidenceError` on
+invalid input), or run the CLI with a file or `-` for JSON on stdin:
+
+```bash
+python3 <skill-root>/scripts/evaluate_pipeline.py evidence.json --compact
+```
+
+Both forms are offline and return the same result. The CLI prints JSON on
+stdout, exits `0` iff `complete` is true, `2` for valid but unresolved
+evidence, and `1` for invalid or unreadable input (`error: ...` on stderr).
+Callers must check the exit code and parse the result. A missing evaluator, a
+timeout, or an invocation failure is unknown, never PASS. Do not change the
+fields or exit semantics without a versioned migration; sibling skills may
+consume them.
+
+Result keys: `expected_sha`, `query_source` (`commit` or `mr_aggregate`),
+`state`, `complete`, `next_action`, `counts`, `expected_required_checks`,
+`required`, `optional`, `stale`, `missing_sha`, `failures`, `summary`.
+`state` is one of `failed`, `running`, `queued`, `unknown`, `stale`, `green`,
+or `no_required_checks`; only `green` is complete. Each failure carries the
+selected `evidence` (kind `artifact`, `step_log`, `check_log`, or `none`).
+Optional failures appear in `summary.optional_failed` without blocking;
+policy-required runs that never appeared are listed in
+`summary.missing_expected_required` and block completion.
 
 ## Polling and Completion
 

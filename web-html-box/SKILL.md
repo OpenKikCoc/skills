@@ -26,11 +26,21 @@ source file -> validate -> exact-viewport preview -> publish to embed target
 Prefer native prose, tables, and images when they carry the content without
 custom interaction. A box augments the page; it does not replace it.
 
+## Paths
+
+Run tools from the installed skill directory and keep data elsewhere:
+`node "$SKILL_ROOT/scripts/<tool>.mjs"`, where `SKILL_ROOT` is this skill's
+directory. Keep sources, screenshots, reports, and archives in a private
+workspace directory outside the skill (the examples below use relative
+`box.html` and `archive/<id>` names inside that workspace). Never write
+generated files into the skill directory.
+
 ## Workflow
 
-1. **Pick the route** (`references/authoring-playbook.md` section 1):
-   collaborative source (a person edits the HTML live in the host) or
-   deterministic automation (an agent publishes, reads back, and archives).
+1. **Pick the route and representation** (`references/authoring-playbook.md`
+   sections 1 and 1b): collaborative source or deterministic automation; plain
+   reflowing HTML goes to the host's native auto-height HTML block, a fixed
+   canvas (or host bridge) only when needed.
 2. **Start from a template**: `assets/html-box-817x560.html` (plain) or
    `assets/html-box-host-817x560.html` (optional host bridge). Change the
    fixed `width`/`height` px in CSS if the viewport is not 817x560.
@@ -50,7 +60,8 @@ custom interaction. A box augments the page; it does not replace it.
    `node scripts/archive-html-box.mjs archive --html box.html --out archive/<id> --preview box.png`,
    publish to the embed target, read back, then
    `archive-html-box.mjs verify --dir archive/<id> --readback readback.html`.
-   Delete the old copy only after verify passes.
+   Delete the old copy only after verify passes. A write with an unseen result
+   is `outcome_unknown`: re-read, never blind-retry.
 
 ## Generation contract
 
@@ -95,16 +106,23 @@ explicit user gesture and a visible result.
 - Do not edit a published record in place if the host rejects it; append a
   replacement, verify, then remove the old one.
 - Hash exact bytes: no trailing newline added by shell tools.
+- Replacing a box: pin the old box with `--expect-old-sha256`, compare the
+  whole page against the approved baseline after every publish and delete, and
+  list comments before and after. A mismatch means no insert and no delete.
+- After a timeout or malformed response from a write, treat the outcome as
+  unknown (`references/publish-and-archive.md` section 5); do not retry blind.
 
 ## Resources
 
 - `scripts/validate-html-box-source.mjs`: static source checks (node >= 18).
 - `scripts/preview-html-box.mjs`: headless Chromium over CDP, exact viewport,
-  overflow assertions, screenshot, JSON report.
+  overflow assertions, screenshot, JSON report; bounded by `--timeout-ms`.
 - `scripts/archive-html-box.mjs`: extract HTML from a stored record, write an
   archive with a sha256 manifest, verify a read-back copy.
-- `scripts/test-html-box.mjs`: `node scripts/test-html-box.mjs`.
+- `scripts/test-html-box.mjs`, `scripts/test-preview-html-box.mjs`: run with
+  `node` (the preview tests use fake sockets and processes, no browser).
 - `assets/`: plain and host-bridge templates.
 - `references/`: authoring playbook, browser verification, publish and
   archive, host capabilities.
-- Related: `web-live-deck` for multi-slide HTML decks.
+- Related: `web-live-deck` for multi-slide HTML decks; `web-diagram` for
+  diagrams; `dev-iteration-loop` external-write contract for publishing.

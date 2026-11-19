@@ -43,6 +43,7 @@ DEFAULT_GROWTH_BYTES = {
     "test_full": 24 * GIB,
     "test_race": 32 * GIB,
 }
+PROC_ROOT = Path("/proc")
 LIVENESS_STATES = {"alive", "dead", "identity_mismatch", "unknown"}
 
 
@@ -187,6 +188,64 @@ def process_group_present(group_id: int) -> bool | None:
         return None
 
 
+def _proc_status_fields(status_path: Path) -> dict[str, list[str]]:
+    fields = {}
+    for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, _, value = line.partition(":")
+        if key in {"NSpid", "Uid"}:
+            fields[key] = value.split()
+    return fields
+
+
+def pid_namespace_gone(namespace: str, uid: int) -> bool | None:
+    """Return True only when /proc proves no process of ``uid`` remains in a namespace.
+
+    The observer must be at the top of this /proc's pid namespace tree (NSpid
+    has exactly one entry), so every descendant namespace's processes are
+    listed here. False means a process is still inside; None means unprovable.
+    A link this uid cannot read is excluded only when its process sits in the
+    observer's namespace (one NSpid entry) or runs under other uids only: an
+    unprivileged sandbox created by the recorded uid stays readable to it, and
+    the recorded owner, child and group run as that uid.
+    Residual: a record from a sibling namespace outside this hierarchy would
+    also look gone. That is accepted because ledger writers are descendants of
+    the host namespace.
+    """
+    try:
+        if len(_proc_status_fields(PROC_ROOT / "self/status").get("NSpid", ())) != 1:
+            return None
+        entries = os.listdir(PROC_ROOT)
+    except OSError:
+        return None
+    if "1" not in entries:
+        return None  # hidepid or a partial /proc cannot list every process.
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            if os.readlink(PROC_ROOT / name / "ns/pid") == namespace:
+                return False
+            continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            pass
+        except OSError:
+            return None
+        try:
+            fields = _proc_status_fields(PROC_ROOT / name / "status")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+        nspid, uids = fields.get("NSpid"), fields.get("Uid")
+        if not nspid or not uids or len(uids) != 4:
+            return None
+        if len(nspid) != 1 and str(uid) in uids:
+            return None
+    return True
+
+
 def inspect_process(identity: Any, *, group: bool = False) -> dict[str, str]:
     """Classify a recorded process without treating a reused PID as its owner."""
     if not isinstance(identity, dict):
@@ -205,6 +264,10 @@ def inspect_process(identity: Any, *, group: bool = False) -> dict[str, str]:
         if observer.get("boot_id") != expected.get("boot_id"):
             return {"status": "identity_mismatch", "reason": "boot_identity_changed"}
         if observer.get("pid_namespace") != expected.get("pid_namespace"):
+            # PIDs from another namespace cannot be probed here; the owner and
+            # its process group are dead only when the whole namespace is gone.
+            if pid_namespace_gone(expected["pid_namespace"], expected["uid"]) is True:
+                return {"status": "dead", "reason": "pid_namespace_gone"}
             return {"status": "unknown", "reason": "pid_namespace_not_comparable"}
     try:
         observed = capture_process_identity(expected["pid"])

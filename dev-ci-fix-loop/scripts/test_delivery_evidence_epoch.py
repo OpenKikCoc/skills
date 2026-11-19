@@ -234,6 +234,38 @@ class DeliveryEvidenceEpochTests(unittest.TestCase):
             ],
         )
 
+    def test_full_delivery_cannot_drop_or_empty_any_required_lane(self) -> None:
+        for lane in CONTRACT.MATRIX_AUTHORITIES:
+            for missing in (True, False):
+                with self.subTest(lane=lane, missing=missing):
+                    packet = base_packet()
+                    if missing:
+                        del packet["matrix"][lane]
+                    else:
+                        packet["matrix"][lane] = []
+                    with self.assertRaisesRegex(
+                        CONTRACT.ContractError, rf"matrix\.{lane}"
+                    ):
+                        CONTRACT.validate_packet(packet)
+
+    def test_full_delivery_cannot_replace_required_source_bound_receipt(self) -> None:
+        for lane in CONTRACT.MATRIX_AUTHORITIES:
+            with self.subTest(lane=lane):
+                packet = base_packet()
+                item = packet["matrix"][lane][0]
+                item.update({
+                    "source_dependency": "source_independent",
+                    "source_sha": None,
+                    "reuse_class": "source_independent",
+                    "independence_basis": "Tool availability is independent of source",
+                })
+                result = CONTRACT.validate_packet(seal(packet))
+                self.assertFalse(result["ready"])
+                self.assertIn(
+                    f"matrix.{lane} requires at least one source-dependent receipt",
+                    result["blockers"],
+                )
+
     def test_same_revision_epoch_is_supported(self) -> None:
         packet = base_packet()
         packet["current_source_sha"] = IMPLEMENTATION_SHA

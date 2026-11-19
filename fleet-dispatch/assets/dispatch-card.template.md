@@ -37,10 +37,33 @@ host_jobs: none
   3. Run gates in parallel by target, not one full serial rerun.
   4. Concurrency changes (queues, async, retries, caches) need interleaving
      tests and an adversarial review.
-- **Prohibited:** pushing to the base branch; force-push; merging or marking a
-  PR ready; deploys or production writes; changing model or effort; spawning
-  other sessions; building tunnels or proxies; editing files outside this
-  item's scope; running fleet admin commands.
+- **Not blockers (never write `blocked` or stop for these):**
+  - live or production acceptance, canaries, deploys, and their receipts belong
+    to the coordinator: deliver `awaiting-verify` and list them in `known_gaps`;
+  - reading or changing code inside this card's scope needs no extra grant;
+  - an optional tool is missing: fall back to plain `grep`/`git grep`/shell;
+  - a shared interface is missing: add the minimum one and name it in Progress;
+  - a provider capacity error (429, "capacity", "overloaded"): wait 1-2 minutes
+    and retry, at most 5 times;
+  - a local experiment environment this card already allows: just use it.
+  Only credentials or logins, production writes, and the meaning of an
+  authorization escalate to the coordinator.
+- **Branch:** you may squash your own commits, rebase onto `{{BASE_BRANCH}}`
+  (base wins conflicts), and `git push --force-with-lease origin <this card's
+  branch>`. That is the only force-push allowed, and only for this card's
+  branch. If the branch is renamed for rework (`<branch>-r2`), preflight rebinds
+  it; no other rename is accepted.
+- **Push each slice:** commit and push every tested slice at once. Uncommitted
+  work older than 45 minutes without a push breaches this card. Do not start
+  review rounds of your own; the coordinator schedules independent review.
+- **Pre-push self-check:** run the project's static checker on every touched
+  package; make tests pass under the default umask, not only under one your
+  shell sets; compare paths after `realpath`, never as typed.
+- **Prohibited:** pushing to the base branch; force-push of anything but this
+  card's own branch (see Branch); merging or marking a PR ready; deploys or
+  production writes; changing model or effort; spawning other sessions;
+  building tunnels or proxies; editing files outside this item's scope;
+  running fleet admin commands.
 - **Escalation:** before the third fix of the same failure class, write a
   one-page design (invariants and a falsifiable test). If the fourth round
   still does not converge, stop; the coordinator will split or redesign.
@@ -60,6 +83,8 @@ host_jobs: none
 `state: in-progress` · `updated: <ISO time>` · `blocker: none` · `doing: <plain words, ≤60 chars>`
 
 ## Progress (worker-appended; at most 3 lines per hour: progress / next / blocker)
+<!-- The last line of every entry is exactly one executable `next_action: <command or edit>`;
+     a relaunched session runs it first. -->
 
 ## Evidence (JSON, filled on completion; schema: evidence-manifest.schema.json)
 ```json

@@ -5,11 +5,13 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import types
 import unittest
 from pathlib import Path
@@ -52,6 +54,8 @@ def build_arguments(**overrides: object) -> argparse.Namespace:
         "graphify_concurrency": 1,
         "token_budget": 12000,
         "api_timeout": 30,
+        "target_timeout": 3,
+        "kill_grace": 0.15,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -646,6 +650,243 @@ class FleetIndexTest(unittest.TestCase):
         )
         self.assertEqual(status["status"], "partial")
         self.assertEqual(status["failed_chunks"], [2])
+
+    def test_target_deadline_records_receipts_and_kills_owned_descendants(self) -> None:
+        row = self.add_target("hung")
+        marker = self.base / "child-pid"
+        child_code = f"import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open({str(marker)!r}, 'w').write(str(os.getpid())); time.sleep(10)"
+        self.launcher.write_text(f"#!{sys.executable}\nimport subprocess,time\nsubprocess.Popen([{sys.executable!r}, '-c', {child_code!r}])\ntime.sleep(10)\n")
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            started = time.monotonic()
+            result = fleet_index.build_target(self.config, row, build_arguments(target_timeout=0.3))
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(result.status, "timed_out")
+            self.assertEqual(result.return_code, 124)
+            self.assertFalse(fleet_index.is_complete(self.config, "hung"))
+            start = json.loads((self.output / "status/hung.build-start.json").read_text())
+            terminal = json.loads((self.output / "status/hung.build-terminal.json").read_text())
+            self.assertEqual(start["operation_id"], terminal["operation_id"])
+            self.assertEqual(start["status"], "running")
+            self.assertEqual(terminal["status"], "timed_out")
+            self.assertIn("finished_at", terminal)
+            child = int(marker.read_text())
+            if Path(f"/proc/{child}/stat").exists():
+                # A reparented zombie is terminated but may await host init reaping.
+                deadline = time.monotonic() + 1
+                while Path(f"/proc/{child}/stat").exists() and time.monotonic() < deadline:
+                    if Path(f"/proc/{child}/stat").read_text().split()[2] == "Z":
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(not Path(f"/proc/{child}/stat").exists() or Path(f"/proc/{child}/stat").read_text().split()[2] == "Z")
+            else:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=2)
+
+    def test_repair_orchestrator_uses_bounded_worker_and_terminal_receipt(self) -> None:
+        self.add_target("repair-hung")
+        write_json(self.config.graph_path("repair-hung"), {"nodes": [], "edges": []})
+        self.config.log_path("repair-hung").parent.mkdir(parents=True)
+        self.config.log_path("repair-hung").write_text("[graphify] chunk 1/1 failed: fixture\n")
+        self.launcher.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(10)\n")
+        args = argparse.Namespace(targets=[], chunk=None, token_budget=12000,
+                                  target_timeout=0.1, kill_grace=0.1)
+        self.assertEqual(fleet_index.repair(self.config, args), 1)
+        terminal = json.loads((self.output / "status/repair-hung.repair-terminal.json").read_text())
+        self.assertEqual(terminal["status"], "timed_out")
+        self.assertEqual(fleet_index.read_status(self.config, "repair-hung").status, "timed_out")
+
+    def test_repair_worker_with_supported_fixture_persists_provenance_and_fragment(self) -> None:
+        self.add_target("repair-worker")
+        write_json(self.config.graph_path("repair-worker"), {"nodes": [], "edges": []})
+        self.config.log_path("repair-worker").parent.mkdir(parents=True)
+        self.config.log_path("repair-worker").write_text("[graphify] chunk 1/1 failed: fixture\n")
+        package_root = self.base / "packages"
+        package = package_root / "graphify"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "llm.py").write_text(
+            "BACKENDS = {}\n"
+            "def extract_files_direct(files, backend='kimi', api_key=None, model=None, root=None, deep_mode=False): return {}\n"
+            "def _read_files(files, root): return ''\n"
+            "def _extraction_system(deep=False): return ''\n"
+            "def _parse_llm_json(content): return {}\n"
+            "def _pack_chunks_by_tokens(files, token_budget=12000): return [files]\n"
+            "def _extract_with_adaptive_retry(files, backend, api_key, model, root, max_depth): return {'nodes': [{'id': 'repaired'}]}\n")
+        (package / "detect.py").write_text("def detect(root, extra_excludes): return {'files': {'document': [root / 'doc.md']}}\n")
+        metadata = package_root / "graphify-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text("Name: graphify\nVersion: 1.0\nHome-page: https://example.test/graphify\n")
+        (metadata / "top_level.txt").write_text("graphify\n")
+        env_file = self.base / "fixture.env"
+        env_file.write_text("OPENAI_API_KEY=fixture\n")
+        env_file.chmod(0o600)
+        config = make_config(self.root, self.output, MODULE_PATH.with_name("graphify-fleet"))
+        args = argparse.Namespace(targets=["repair-worker"], chunk=None, token_budget=12000,
+                                  target_timeout=3, kill_grace=0.1)
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(package_root), "GRAPHIFY_PYTHON": sys.executable,
+                                        "GRAPHIFY_FLEET_ENV": str(env_file), "GRAPHIFY_LLM_BASE_URL": "https://example.test/v1", "GRAPHIFY_LLM_MODEL": "m"}):
+            self.assertEqual(fleet_index.repair(config, args), 0)
+        self.assertEqual(fleet_index.read_status(config, "repair-worker").status, "repaired")
+        self.assertTrue(config.fragment_path("repair-worker").is_file())
+        provenance = json.loads((self.output / "status/repair-worker.repair-graphify.json").read_text())
+        terminal = json.loads((self.output / "status/repair-worker.repair-terminal.json").read_text())
+        self.assertEqual(provenance["version"], "1.0")
+        self.assertEqual(provenance["operation_id"], terminal["operation_id"])
+        self.assertIn("_extract_with_adaptive_retry", provenance["signatures"])
+
+    def test_sigterm_cancels_only_started_worker_and_records_terminal(self) -> None:
+        self.add_target("cancel")
+        marker = self.base / "started"
+        self.launcher.write_text(f"#!{sys.executable}\nimport pathlib,time\npathlib.Path({str(marker)!r}).write_text('ready')\ntime.sleep(10)\n")
+        process = subprocess.Popen([sys.executable, str(MODULE_PATH), "build", "--root", str(self.root),
+                                    "--output", str(self.output), "--launcher", str(self.launcher),
+                                    "--disk-floor-bytes", "1", "--target-timeout", "30", "--kill-grace", "1"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "worker never became ready")
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+            terminal = json.loads((self.output / "status/cancel.build-terminal.json").read_text())
+            self.assertEqual(terminal["status"], "cancelled")
+            self.assertEqual(fleet_index.read_status(self.config, "cancel").status, "cancelled")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
+
+    def test_preparation_failure_still_records_failed_terminal(self) -> None:
+        compatibility = self.output / "status/repo.build-graphify.json"
+        compatibility.mkdir(parents=True)
+        with mock.patch.object(fleet_index.subprocess, "Popen") as spawn:
+            with self.assertRaises(IsADirectoryError):
+                fleet_index.run_target_process(self.config, "repo", [str(self.launcher)],
+                                               phase="build", timeout=1, grace=0.1, log_path=self.base / "build.log")
+            spawn.assert_not_called()
+        start = json.loads((self.output / "status/repo.build-start.json").read_text())
+        terminal = json.loads((self.output / "status/repo.build-terminal.json").read_text())
+        self.assertEqual(start["operation_id"], terminal["operation_id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertNotEqual(terminal["return_code"], 0)
+
+    def test_repair_missing_or_invalid_artifacts_cannot_be_noop(self) -> None:
+        self.add_target("repo")
+        args = argparse.Namespace(targets=[], chunk=None, token_budget=12000, target_timeout=1, kill_grace=0.1)
+        for graph, log in ((None, None), ({"nodes": [], "edges": []}, None),
+                           (None, "complete"), ([], "complete"), ({"nodes": "invalid"}, "complete")):
+            with self.subTest(graph=graph, log=log):
+                self.config.graph_path("repo").unlink(missing_ok=True)
+                self.config.log_path("repo").unlink(missing_ok=True)
+                if graph is not None:
+                    write_json(self.config.graph_path("repo"), graph)
+                if log is not None:
+                    self.config.log_path("repo").parent.mkdir(parents=True, exist_ok=True)
+                    self.config.log_path("repo").write_text(log)
+                with mock.patch.object(fleet_index, "run_target_process") as worker:
+                    self.assertEqual(fleet_index.repair(self.config, args), 1)
+                    worker.assert_not_called()
+                summary = json.loads((self.output / "repair-summary.json").read_text())
+                self.assertEqual(summary["results"][0]["status"], "failed")
+
+    def test_repair_rejects_stale_or_inconsistent_success_evidence(self) -> None:
+        self.add_target("repo")
+        write_json(self.config.graph_path("repo"), {"nodes": [], "edges": []})
+        self.config.log_path("repo").parent.mkdir(parents=True)
+        self.config.log_path("repo").write_text("[graphify] chunk 1/1 failed: fixture\n")
+        args = argparse.Namespace(targets=[], chunk=None, token_budget=12000, target_timeout=1, kill_grace=0.1)
+        for broken in ("provenance", "fragment", "audit", "state", "coverage", "counts", None):
+            with self.subTest(broken=broken):
+                def worker(*_args, **_kwargs):
+                    fragment = {"nodes": [{"id": "new"}], "edges": [], "repo": "repo", "repair_fragment": True, "operation_id": "current"}
+                    audit = {"operation_id": "current", "status": "repaired", "repository": "repo",
+                             "fragment_path": str(self.config.fragment_path("repo")), "chunk_indexes": [1],
+                             "repaired_files": ["doc.md"], "nodes_added": 1, "edges_added": 0, "hyperedges_added": 0}
+                    provenance = {"operation_id": "current", "package": "graphify", "version": "fixture",
+                                  "source": "fixture", "module_path": "fixture", "module_sha256": "a" * 64,
+                                  "signatures": {"_pack_chunks_by_tokens": [], "_extract_with_adaptive_retry": []}}
+                    if broken in ("provenance", "fragment", "audit"):
+                        {"provenance": provenance, "fragment": fragment, "audit": audit}[broken]["operation_id"] = "old"
+                    if broken == "coverage":
+                        audit["chunk_indexes"] = []
+                    if broken == "counts":
+                        audit["nodes_added"] = 2
+                    write_json(self.config.fragment_path("repo"), fragment)
+                    write_json(self.config.repair_audit_path("repo"), audit)
+                    write_json(self.output / "status/repo.repair-graphify.json", provenance)
+                    fleet_index.write_status(self.config, fleet_index.BuildResult(name="repo", status="running" if broken == "state" else "repaired", repair_fragment=str(self.config.fragment_path("repo"))))
+                    return {"operation_id": "current", "status": "exited", "return_code": 0}
+                with mock.patch.object(fleet_index, "run_target_process", side_effect=worker):
+                    self.assertEqual(fleet_index.repair(self.config, args), 0 if broken is None else 1)
+        self.config.log_path("repo").write_text("complete\n")
+        with mock.patch.object(fleet_index, "run_target_process") as worker:
+            self.assertEqual(fleet_index.repair(self.config, args), 0)
+            worker.assert_not_called()
+
+    def test_repair_zero_exit_without_current_evidence_fails(self) -> None:
+        self.add_target("repo")
+        write_json(self.config.graph_path("repo"), {"nodes": [], "edges": []})
+        self.config.log_path("repo").parent.mkdir(parents=True)
+        self.config.log_path("repo").write_text("[graphify] chunk 1/1 failed: fixture\n")
+        self.launcher.write_text(f"#!{sys.executable}\npass\n")
+        args = argparse.Namespace(targets=[], chunk=None, token_budget=12000, target_timeout=1, kill_grace=0.1)
+        self.assertEqual(fleet_index.repair(self.config, args), 1)
+        self.assertEqual(fleet_index.read_status(self.config, "repo").status, "failed")
+        self.assertFalse(self.config.fragment_path("repo").exists())
+        summary = json.loads((self.output / "repair-summary.json").read_text())
+        self.assertEqual(summary["results"][0]["status"], "failed")
+
+    def test_spawn_failure_still_records_terminal_receipt(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            fleet_index.run_target_process(self.config, "missing", [str(self.base / "absent")],
+                                           phase="build", timeout=1, grace=0.1, log_path=self.base / "missing.log")
+        terminal = json.loads((self.output / "status/missing.build-terminal.json").read_text())
+        self.assertEqual(terminal["status"], "failed")
+        self.assertIn("finished_at", terminal)
+
+    def test_second_coordinator_on_same_output_root_is_refused(self) -> None:
+        self.add_target("repo")
+        args = build_arguments()
+        with fleet_index.CoordinatorLock(self.config):
+            with self.assertRaisesRegex(fleet_index.FleetError, "another coordinator"):
+                fleet_index.build(self.config, args)
+            with self.assertRaisesRegex(fleet_index.FleetError, "another coordinator"):
+                fleet_index.repair(self.config, argparse.Namespace(
+                    targets=[], chunk=None, token_budget=12000, target_timeout=1, kill_grace=0.1))
+            # A dry run only reads and does not need the lock.
+            self.assertEqual(fleet_index.build(self.config, build_arguments(dry_run=True)), 0)
+        self.assertEqual(fleet_index.build(self.config, args), 0)
+
+    def test_start_only_receipt_is_an_unknown_attempt_and_is_not_relaunched(self) -> None:
+        row = self.add_target("crashed")
+        status = self.output / "status"
+        write_json(status / "crashed.build-start.json", {"operation_id": "x", "status": "running"})
+        result = fleet_index.build_target(self.config, row, build_arguments())
+        self.assertEqual(result.status, "unknown_attempt")
+        self.assertFalse(self.config.graph_path("crashed").exists())
+        self.assertEqual(fleet_index.unknown_attempts(self.config, "crashed"), ["build"])
+        # A target named like a phase-suffixed neighbour is not confused with it.
+        self.assertEqual(fleet_index.unknown_attempts(self.config, "crash"), [])
+        forced = fleet_index.build_target(self.config, row, build_arguments(force=True))
+        self.assertEqual(forced.status, "success")
+        self.assertEqual(fleet_index.unknown_attempts(self.config, "crashed"), [])
+
+    def test_timed_out_target_is_failure_and_is_not_retried_in_the_same_run(self) -> None:
+        self.add_target("slow")
+        self.launcher.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(10)\n")
+        args = build_arguments(target_timeout=0.2, kill_grace=0.1)
+        self.assertEqual(fleet_index.build(self.config, args), 1)
+        status = fleet_index.read_status(self.config, "slow")
+        self.assertEqual(status.status, "timed_out")
+        terminal = json.loads((self.output / "status/slow.build-terminal.json").read_text())
+        self.assertEqual(terminal["status"], "timed_out")
 
 
 if __name__ == "__main__":

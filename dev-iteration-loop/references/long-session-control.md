@@ -98,6 +98,30 @@ wall-clock saving it provides.
 
 At L2, update state through `checkpoint --patch-file ... --expected-revision ...`. The script uses a lock, compare-and-swap revision, atomic state replacement, and invariant validation. Do not checkpoint routine reads, local edits, status messages, or every test invocation. Before completing a milestone, record fresh evidence for every required acceptance ID. A worker's `complete` status alone is never evidence.
 
+## Compose a parallel wave beneath the root cursor
+
+For multi-writer work outside fleet dispatch cards, the root packet alone owns
+the user outcome, foreground milestone, and foreground `next_action`. The
+`fleet-parallel-merge` checkpoint owns only Git/resource recovery; its
+`current` and structured `next_action` are domain steps, not a second cursor.
+
+Before interruption, persist the wave checkpoint outside disposable roots, then
+checkpoint the root's optional `wave_recovery` binding (path, exact byte
+SHA-256, foreground milestone, null completion). Set root `next_action` to
+`fleet-parallel-merge resume-validate checkpoint <checkpoint_path>`. That is the
+single wave recovery entry, not permission to execute shell text: translate it
+to `restart_checkpoint.py resume-validate --input` with a fresh observed
+snapshot. Keep all recovery substeps under this entry: blocked receipts need
+reconciliation; `reconstruct_fresh` needs real resource restoration and another
+validation of a successor checkpoint hash-linked to the original.
+
+Only a hash-bound `resume_existing` receipt with no blockers completes wave
+recovery. Attach its path/hash as `wave_recovery.completion` before advancing
+root milestones or replacing the foreground action; clear the binding only
+after that. Never turn a wave receipt into user acceptance, cleanup authority,
+or a second host goal. Missing or changed receipts block continuation and
+writes. Schema: [long-session-state-contract.md](long-session-state-contract.md).
+
 ## Continue through ordinary compact
 
 After compact, first determine whether the host goal is still active. At L0/L1,

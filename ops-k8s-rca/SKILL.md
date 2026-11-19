@@ -11,26 +11,28 @@ cause, a past case, or a graph neighbor stand in for an observation.
 
 ## Operating model
 
-Keep three planes separate:
+Keep three layers separate:
 
-1. **State plane** - live objects, events, metrics, component logs, node files,
+1. **State layer** - live objects, events, metrics, component logs, node files,
    versions, leases, change history. Collected with `kubectl` (read-only first).
-2. **Knowledge plane** - a code/doc graph or retrieval service. Proposes
+2. **Knowledge layer** - a code/doc graph or retrieval service. Proposes
    mechanisms and code anchors; never observes the cluster.
-3. **Verification plane** - the deployed source revision plus checks that
+3. **Verification layer** - the deployed source revision plus checks that
    distinguish competing mechanisms.
 
-Compose specialists rather than copying their commands: use this skill for
-orchestration and the evidence discipline, and bring in domain tooling (node
-access, log backends, graph retrieval such as `dev-code-graph`) as needed.
-If a plane is unavailable, continue with the others and record the gap.
+Use this skill for orchestration and evidence discipline; bring in domain
+tooling (node access, log backends, graph retrieval such as `dev-code-graph`)
+as needed. If a layer is unavailable, continue with the others and record the gap.
 
 ## Experience is hypothesis routing, not truth
 
-Past incidents, runbooks and casebooks may suggest competing hypotheses and
-discriminating checks. They cannot confirm the current incident, authorize
-remediation, or replace live evidence and deployed-source verification. A
-single past case is an example, not a rule.
+Past incidents, runbooks and past-incident notes may suggest competing
+hypotheses and discriminating checks. They cannot confirm the current
+incident, authorize remediation, or replace live evidence and deployed-source
+verification. A single past case is an example, not a rule. A match proposes
+hypotheses; it never confirms. Optional enrichment calls (retrieval,
+past-incident lookup, ticket history) are bounded and non-fatal: if one fails or
+times out, record the gap and continue on live evidence.
 
 ## Execution loop
 
@@ -63,6 +65,31 @@ single past case is an example, not a rule.
 8. **Report** per [rca-deliverable.md](references/rca-deliverable.md). Publish a
    provisional brief at the time-box rather than waiting for every lane.
 
+## Conclusion rules
+
+Full text: [conclusion-contract.md](references/conclusion-contract.md).
+
+- Open with a root-cause statement (mechanism, layer, scope) and `high` or
+  `medium` confidence, not a symptom and not a candidate.
+- Once the discriminator is observed on the affected objects, the root-cause
+  line carries no "possibly" or "suspected". Deployed-source mechanism plus the
+  matching live object order is a conclusion.
+- Falsified hypotheses go under Excluded with the one excluding fact. Gaps that
+  cannot change the conclusion are follow-ups, each with its exact read.
+- "Cannot confirm" is allowed only without a matching mechanism, and still gives
+  the best hypothesis and the single settling read. A hand-off or owner list is
+  never the answer.
+- In a long investigation, keep an interim "current conclusion" line updated.
+
+## Evidence binding
+
+Bind every fact to the exact UID, the incident window with timezone, and the
+lifecycle phase. Current state never refutes past state. Keep same-batch
+healthy/unhealthy controls separate from direct evidence. Scheduler
+explain/simulation output is capture-time only. Missing or truncated logs are
+coverage gaps, not "no error". Grades and freshness rules:
+[entity-derivation-and-freshness.md](references/entity-derivation-and-freshness.md).
+
 ## Decision rules
 
 - A confirmed root cause needs matching OBSERVED facts, verified source
@@ -89,7 +116,6 @@ collected (`kubectl get pods,events -A -o json`), offline and read-only:
 python3 scripts/pod_startup_classify.py --first first.json --second second.json
 python3 scripts/pod_startup_classify.py --second now.json --format json
 ```
-
 Test: `python3 -I scripts/test_pod_startup_classify.py`.
 
 `scripts/owner_chain.py` builds Pod -> owner chains from collected
@@ -99,20 +125,26 @@ cycles (exit 1 on findings):
 ```bash
 python3 scripts/owner_chain.py pods.json rs.json deploy.json --pod <name>
 ```
-
 Test: `python3 -I scripts/test_owner_chain.py`.
 
 ## References
 
-- [pod-startup-audit.md](references/pod-startup-audit.md) - snapshots, event
-  correlation, classes, decision gates.
+- [pod-startup-audit.md](references/pod-startup-audit.md) - snapshots, events, classes.
 - [mechanism-mapping.md](references/mechanism-mapping.md) - using a retrieval
   graph, evidence labels, version verification.
-- [rca-deliverable.md](references/rca-deliverable.md) - report structure and
-  state vocabulary.
+- [rca-deliverable.md](references/rca-deliverable.md) - report structure.
 - [control-plane-diagnosis.md](references/control-plane-diagnosis.md) - Lease
   leader lookup, all-replica logs, restart forensics, "why unschedulable".
 - [change-attribution.md](references/change-attribution.md) - rollout, GitOps,
   Helm, managedFields and audit history; nearby versus caused.
+- [conclusion-contract.md](references/conclusion-contract.md) - answer shape, self-check.
+- [mechanism-checks.md](references/mechanism-checks.md) - signature, mechanism,
+  ordered reads, falsifiers for recurring mechanisms (version boundaries,
+  fixed-upstream, runtime pairing, I/O hang, two-source resource mismatch).
+- [pending-pod-drilldown.md](references/pending-pod-drilldown.md) - last-stage
+  layer map and filter-stage rules for Pending Pods.
+- [entity-derivation-and-freshness.md](references/entity-derivation-and-freshness.md)
+  - entity derivation, freshness, evidence grades.
+- [disk-attribution.md](references/disk-attribution.md) - df to task attribution.
 - [workload-identity.md](references/workload-identity.md) - URL/ID/name to a
-  verified identity packet (owner chain, UID, cluster); refuse if ambiguous.
+  verified identity (owner chain, UID, cluster).

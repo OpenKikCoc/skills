@@ -67,7 +67,9 @@ card ──route──▶ launch worker (L1, effort from complexity)
 5. **Verify, review, land.** A worker's "awaiting-verify" is a claim.
    `fleet.py verify` checks the manifest mechanically; a reviewer in a
    different session records a bound verdict; only the coordinator lands, and
-   only that SHA. See [review-and-land.md](references/review-and-land.md).
+   only that SHA. A non-code card, or a candidate that adds nothing to the base,
+   closes through `fleet.py complete-verified` instead of `land`. See
+   [review-and-land.md](references/review-and-land.md).
 6. **Supervise from elsewhere (optional).** The L3 supervisor pulls the
    attention log over SSH (`fleet.py wait --after N`); the fleet never connects
    to it. See [supervision.md](references/supervision.md).
@@ -97,10 +99,12 @@ card ──route──▶ launch worker (L1, effort from complexity)
 | `fleet-remote-runner` | executor for host-specific queued jobs |
 | `fleet-tui-probe` | read-only state probe for interactive TUI sessions |
 | `dev-ci-fix-loop` | drive the landed branch's CI to green |
+| `dev-code-review` | the reviewer role's standard for finding quality (evidence first, reproduce before claiming) |
 | `fleet-parallel-merge` | exception path when several writers share one change (immutable base, disjoint write sets, ordered integration) |
 | `dev-disk-budget` | reserve and safely clean worktrees, caches, and temp roots |
 
 Integration details and runtime adapters (Codex, Claude Code, others):
 [runtime-adapters.md](references/runtime-adapters.md). Running the CLIs on a
-separate host (SSH, personas, loopback dashboards, credential preflight):
+separate host (durable SSH sessions, personas and their qualification,
+loopback dashboards, credential preflight, outer-transport trust):
 [remote-runtime-host.md](references/remote-runtime-host.md).

@@ -82,6 +82,24 @@ strand the task between phases.
   `log_stalled`, and proceeds to restoration.
 - Heartbeat timeout classifies an abnormal nonterminal runner from the observer.
 - SSH transport failure remains observer failure, not remote task failure.
+- Each local SSH operation has a finite positive `--timeout-seconds` (default
+  30). `poll --max-wait-seconds` uses one monotonic end-to-end deadline, passes
+  `min(per-call timeout, remaining budget)` into every status call, bounds sleep,
+  and never accepts a terminal response received after its deadline. A local
+  deadline alarm also interrupts status decoding/serialization; it controls
+  only the observer. Poll output packets are capped at 4096 bytes (oversized
+  updates carry `output_truncated:true`) and pipe writes are nonblocking with
+  the remaining budget. Expiry emits a final `observer_timeout`, `complete:false`
+  and `remote work is unchanged`; if stdout is full it attempts stderr without
+  waiting. If both channels are unread/full, delivery cannot be guaranteed, but
+  observer exit remains bounded. Omitted max-wait permits continued observation,
+  not an unbounded SSH connection or output write.
+- Timeout reaps only local SSH and reports `observer/transport timeout`;
+  `observer_timeout` means `complete: false`. No remote kill or relaunch follows.
+  Reconnect to reconcile durable state. A launch timeout is outcome unknown,
+  including whether preflight or publication completed; never repeat launch
+  automatically. Sync timeout removes its partial local archive and publishes
+  no destination. File-backed SSH output avoids waiting on proxy-held pipes.
 
 ## Restoration Gate
 

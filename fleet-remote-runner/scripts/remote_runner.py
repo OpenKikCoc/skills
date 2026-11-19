@@ -9,8 +9,10 @@ import copy
 import hashlib
 import io
 import json
+import math
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -26,6 +28,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 
 SCHEMA_VERSION = 1
+SSH_TIMEOUT_SECONDS = 30.0
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 SESSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,252}$")
@@ -121,9 +124,11 @@ REQUIRED_REMOTE_PYTHON_MODULES = (
     "hashlib",
     "io",
     "json",
+    "math",
     "os",
     "pathlib",
     "re",
+    "select",
     "shlex",
     "shutil",
     "signal",
@@ -714,15 +719,38 @@ def remote_control_argv(
     return ssh_base_argv(manifest) + [remote_command]
 
 
-def run_ssh_json(argv: Sequence[str]) -> Dict[str, Any]:
-    completed = subprocess.run(argv, capture_output=True, text=True, check=False)
+def require_timeout(seconds: float) -> float:
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise SupervisorError("observer timeout must be finite and positive")
+    return seconds
+
+
+def run_ssh_json(
+    argv: Sequence[str], timeout_seconds: float = SSH_TIMEOUT_SECONDS
+) -> Dict[str, Any]:
+    # File-backed output avoids an unbounded pipe drain if a local SSH proxy
+    # descendant inherits stdout/stderr after SSH itself has been reaped.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+        try:
+            completed = subprocess.run(
+                argv, stdout=stdout, stderr=stderr, check=False,
+                timeout=require_timeout(timeout_seconds),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TransportError(
+                "observer/transport timeout; remote work is unchanged"
+            ) from error
+        stdout.seek(0)
+        stderr.seek(0)
+        output, errors = stdout.read(), stderr.read()
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+        detail = errors.strip() or output.strip() or "no output"
         raise TransportError(
             f"SSH command failed with exit {completed.returncode}: {detail}"
         )
     try:
-        value = json.loads(completed.stdout)
+        value = json.loads(output)
     except json.JSONDecodeError as error:
         raise TransportError(f"remote status returned invalid JSON: {error}") from error
     if not isinstance(value, dict):
@@ -730,29 +758,46 @@ def run_ssh_json(argv: Sequence[str]) -> Dict[str, Any]:
     return value
 
 
-def fetch_remote_status(manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    return run_ssh_json(remote_control_argv(manifest, "_remote-status"))
+def fetch_remote_status(
+    manifest: Mapping[str, Any], timeout_seconds: float = SSH_TIMEOUT_SECONDS
+) -> Dict[str, Any]:
+    return run_ssh_json(remote_control_argv(manifest, "_remote-status"), timeout_seconds)
 
 
 def poll_until_terminal(
-    fetch: Callable[[], Dict[str, Any]],
+    fetch: Callable[[float], Dict[str, Any]],
     interval_seconds: float,
     max_wait_seconds: Optional[float],
     on_update: Optional[Callable[[Dict[str, Any]], None]] = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    ssh_timeout_seconds: float = SSH_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
-    started = clock()
+    require_timeout(interval_seconds)
+    require_timeout(ssh_timeout_seconds)
+    deadline = (
+        clock() + require_timeout(max_wait_seconds)
+        if max_wait_seconds is not None else None
+    )
     transport_errors = 0
+
+    def remaining() -> float:
+        return deadline - clock() if deadline is not None else float("inf")
+
+    def observer_timeout() -> Dict[str, Any]:
+        return {
+            "effective_status": "observer_timeout",
+            "complete": False,
+            "transport_errors": transport_errors,
+            "error": "observer/transport timeout; remote work is unchanged",
+        }
+
     while True:
-        if max_wait_seconds is not None and clock() - started >= max_wait_seconds:
-            return {
-                "effective_status": "observer_timeout",
-                "complete": False,
-                "transport_errors": transport_errors,
-            }
+        budget = remaining()
+        if budget <= 0:
+            return observer_timeout()
         try:
-            status = fetch()
+            status = fetch(min(ssh_timeout_seconds, budget))
         except TransportError as error:
             transport_errors += 1
             status = {
@@ -761,12 +806,47 @@ def poll_until_terminal(
                 "transport_errors": transport_errors,
                 "error": str(error),
             }
+        if remaining() <= 0:
+            return observer_timeout()
         if on_update:
             on_update(status)
+        if remaining() <= 0:
+            return observer_timeout()
         if status.get("complete"):
             status["transport_errors"] = transport_errors
             return status
-        sleep(interval_seconds)
+        sleep(min(interval_seconds, max(0.0, remaining())))
+
+
+def observer_alarm(signum: int, frame: Any) -> None:
+    raise TransportError("observer/transport timeout; remote work is unchanged")
+
+
+def emit_observer_packet(status: Dict[str, Any], deadline: float, fd: int = 1) -> bool:
+    """Bound packet size and pipe backpressure without a buffered flush at exit."""
+    data = json.dumps(status, sort_keys=True).encode() + b"\n"
+    if len(data) > 4096:
+        data = (json.dumps({
+            "effective_status": str(status.get("effective_status", "unknown"))[:64],
+            "complete": status.get("complete") is True,
+            "output_truncated": True,
+        }, sort_keys=True) + "\n").encode()
+    blocking = os.get_blocking(fd)
+    os.set_blocking(fd, False)
+    try:
+        while data:
+            try:
+                count = os.write(fd, data)
+                data = data[count:]
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
+                    return False
+            except OSError:
+                return False
+        return True
+    finally:
+        os.set_blocking(fd, blocking)
 
 
 def resolve_under(root: Path, relative: str) -> Path:
@@ -1608,24 +1688,36 @@ def verify_synced_artifacts(
     return sync_receipt
 
 
-def sync_remote(manifest: Mapping[str, Any], destination: Path) -> Dict[str, Any]:
+def sync_remote(
+    manifest: Mapping[str, Any], destination: Path,
+    timeout_seconds: float = SSH_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
     if destination.exists():
         raise SupervisorError(f"sync destination already exists: {destination}")
     destination_parent = destination.parent.resolve()
     destination_parent.mkdir(parents=True, exist_ok=True)
+    require_timeout(timeout_seconds)
     with tempfile.NamedTemporaryFile(
-        prefix=".durable-task-sync-", suffix=".tar.gz", dir=destination_parent, delete=False
+        prefix=".remote-runner-sync-", suffix=".tar.gz", dir=destination_parent, delete=False
     ) as temporary:
         archive_path = Path(temporary.name)
-        completed = subprocess.run(
-            remote_control_argv(manifest, "_remote-sync"),
-            stdout=temporary,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
     try:
+        with archive_path.open("wb") as temporary, tempfile.TemporaryFile() as stderr:
+            try:
+                completed = subprocess.run(
+                    remote_control_argv(manifest, "_remote-sync"),
+                    stdout=temporary,
+                    stderr=stderr,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise TransportError(
+                    "observer/transport timeout during sync; remote work is unchanged"
+                ) from error
+            stderr.seek(0)
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
         if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
             raise TransportError(
                 f"remote sync failed with exit {completed.returncode}: {detail}"
             )
@@ -1683,6 +1775,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     sync.add_argument("--manifest", required=True, type=Path)
     sync.add_argument("--destination", required=True, type=Path)
+    for observer in (launch, status, poll, sync):
+        observer.add_argument("--timeout-seconds", type=float, default=SSH_TIMEOUT_SECONDS,
+                              help="Maximum duration of each local SSH connection.")
 
     remote_run_parser = subparsers.add_parser("_remote-run")
     remote_run_parser.add_argument("--state-dir", required=True, type=Path)
@@ -1703,11 +1798,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(plan, sort_keys=True, indent=2))
         if not args.execute:
             return 0
-        completed = subprocess.run(
-            plan["ssh_argv"],
-            input=build_launch_payload(manifest, runner_bytes),
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                plan["ssh_argv"],
+                input=build_launch_payload(manifest, runner_bytes),
+                check=False,
+                timeout=require_timeout(args.timeout_seconds),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TransportError(
+                "observer/transport timeout during launch; outcome unknown; "
+                "reconcile the declared state directory/session, never relaunch automatically"
+            ) from error
         if completed.returncode != 0:
             raise TransportError(
                 f"SSH launch failed with exit {completed.returncode}"
@@ -1715,7 +1817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.action == "status":
         manifest = load_manifest(args.manifest)
-        status = fetch_remote_status(manifest)
+        status = fetch_remote_status(manifest, args.timeout_seconds)
         print(json.dumps(status, sort_keys=True, indent=2))
         return 0
     if args.action == "poll":
@@ -1723,17 +1825,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SupervisorError("--interval-seconds must be positive")
         if args.max_wait_seconds is not None and args.max_wait_seconds <= 0:
             raise SupervisorError("--max-wait-seconds must be positive")
-        manifest = load_manifest(args.manifest)
+        deadline = (time.monotonic() + require_timeout(args.max_wait_seconds)
+                    if args.max_wait_seconds is not None else None)
+        previous_handler = None
+        if deadline is not None:
+            previous_handler = signal.signal(signal.SIGALRM, observer_alarm)
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic()))
 
         def emit(status_value: Dict[str, Any]) -> None:
-            print(json.dumps(status_value, sort_keys=True), flush=True)
+            output_deadline = deadline if deadline is not None else time.monotonic() + args.timeout_seconds
+            if not emit_observer_packet(status_value, output_deadline):
+                raise TransportError("observer output timeout")
 
-        result = poll_until_terminal(
-            lambda: fetch_remote_status(manifest),
-            args.interval_seconds,
-            args.max_wait_seconds,
-            on_update=emit,
-        )
+        try:
+            manifest = load_manifest(args.manifest)
+            budget = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+            if budget == 0:
+                raise TransportError("observer timeout")
+            result = poll_until_terminal(
+                lambda timeout: fetch_remote_status(manifest, timeout),
+                args.interval_seconds,
+                budget,
+                on_update=emit,
+                ssh_timeout_seconds=args.timeout_seconds,
+            )
+        except TransportError:
+            result = {"effective_status": "observer_timeout", "complete": False}
+        finally:
+            if deadline is not None:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+        if result.get("effective_status") == "observer_timeout":
+            result["error"] = "observer/transport timeout; remote work is unchanged"
+            # At expiry, only immediate nonblocking delivery is permitted. If stdout
+            # is full, report through stderr instead; neither channel may extend the budget.
+            now = time.monotonic()
+            if not emit_observer_packet(result, now):
+                emit_observer_packet(result, now, fd=2)
         if result.get("effective_status") == "succeeded":
             return 0
         if result.get("effective_status") == "failed":
@@ -1741,7 +1869,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if args.action == "sync":
         manifest = load_manifest(args.manifest)
-        receipt = sync_remote(manifest, args.destination)
+        receipt = sync_remote(manifest, args.destination, args.timeout_seconds)
         print(json.dumps(receipt, sort_keys=True, indent=2))
         return 0
     if args.action == "_remote-run":

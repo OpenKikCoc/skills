@@ -24,10 +24,26 @@ Rules while debugging: never print the key, never paste request URLs with
 credentials embedded into tickets, and prefer `doctor` over dumping the
 environment.
 
-## Compatibility
+## Compatibility guard
 
-The backend hooks `graphify.llm.BACKENDS`, `extract_files_direct`,
-`_extraction_system`, `_read_files`, and `_parse_llm_json`. Private names can
-change between releases; they were checked against `graphifyy` 0.9.100. After
-upgrading Graphify, run `graphify-fleet doctor` and `smoke-test` before a fleet
-build.
+The backend hooks `graphify.llm.BACKENDS` and `extract_files_direct`, and calls
+the private helpers `_extraction_system`, `_read_files` and `_parse_llm_json`
+(repair also calls `_pack_chunks_by_tokens` and `_extract_with_adaptive_retry`).
+Private names can change between releases, so before patching anything the
+wrapper inspects each function with `inspect.signature` and `bind()`s the exact
+call shape it uses. A missing function, a changed signature, or a variadic
+signature (`*args` / `**kwargs`, which cannot be verified) stops the run with
+`unsupported Graphify` before any extraction or backend registration.
+
+The same check writes a provenance receipt: package version, source URL with
+credentials, query and fragment removed, and the sha256 of the loaded
+`graphify/llm.py`. It is printed to stderr and, when `GRAPHIFY_COMPAT_RECEIPT`
+is set (the fleet orchestrator sets it per target phase), saved as JSON. The
+API key is redacted from the receipt; only parameter names, kinds and whether
+they are required are recorded, never default values.
+
+Registration is idempotent: calling it again wraps the pristine
+`extract_files_direct` saved on the first call, so wrappers never stack.
+
+After upgrading Graphify, run `graphify-fleet doctor` and `smoke-test`, then a
+small `fleet build` and read the receipt before a large run.

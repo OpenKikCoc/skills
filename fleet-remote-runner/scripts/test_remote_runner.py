@@ -45,6 +45,93 @@ class RemoteRunnerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
 
+    def poll_cli(self, large=False, blocked=False):
+        ssh = self.root / "ssh"
+        ssh.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps(" +
+                       repr({"complete": False, "effective_status": "running",
+                             "padding": "x" * (131072 if large else 0)}) + "))\n")
+        ssh.chmod(0o755)
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps(self.manifest()))
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+        args = [sys.executable, str(MODULE_PATH), "poll", "--manifest", str(manifest),
+                "--max-wait-seconds", "0.15", "--interval-seconds", "0.001" if blocked else "1"]
+        started = time.monotonic()
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        try:
+            if blocked:
+                process.wait(timeout=0.8)
+            stdout, stderr = process.communicate(timeout=0.8)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertLess(time.monotonic() - started, 0.8)
+        return process.returncode, stdout.decode(), stderr.decode()
+
+    def test_poll_cli_reports_final_observer_timeout(self):
+        rc, stdout, stderr = self.poll_cli()
+        self.assertEqual(rc, 2)
+        packet = json.loads(stdout.splitlines()[-1])
+        self.assertEqual(packet["effective_status"], "observer_timeout")
+        self.assertFalse(packet["complete"])
+        self.assertIn("remote work is unchanged", packet["error"])
+
+    def test_poll_cli_deadline_covers_local_status_processing(self):
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps(self.manifest()))
+        code = (
+            "import importlib.util, time; "
+            "s=importlib.util.spec_from_file_location('remote_runner', " + repr(str(MODULE_PATH)) + "); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "m.fetch_remote_status=lambda *args: (time.sleep(.6) or "
+            "{'complete': False, 'effective_status': 'running'}); "
+            "raise SystemExit(m.main(['poll', '--manifest', " + repr(str(manifest)) +
+            ", '--max-wait-seconds', '.15']))"
+        )
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=2)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("observer_timeout", result.stdout)
+
+    def test_poll_cli_full_stdout_reports_timeout_on_stderr(self):
+        ssh = self.root / "ssh"
+        ssh.write_text('#!/bin/sh\nprintf \'{"complete":false,"effective_status":"running"}\\n\'\n')
+        ssh.chmod(0o755)
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps(self.manifest()))
+        reader, writer = os.pipe()
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                try:
+                    os.write(writer, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+            process = subprocess.Popen([sys.executable, str(MODULE_PATH), "poll", "--manifest",
+                                        str(manifest), "--max-wait-seconds", ".15"],
+                                       stdout=writer, stderr=subprocess.PIPE, env=env)
+            try:
+                _, stderr = process.communicate(timeout=.8)
+                self.assertEqual(process.returncode, 2)
+                self.assertIn(b"observer_timeout", stderr)
+                self.assertIn(b"remote work is unchanged", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_poll_cli_nonreading_stdout_is_bounded(self):
+        rc, stdout, stderr = self.poll_cli(large=True, blocked=True)
+        self.assertEqual(rc, 2)
+        self.assertIn("observer_timeout", stdout + stderr)
+        self.assertIn("remote work is unchanged", stdout + stderr)
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
@@ -412,6 +499,129 @@ class RemoteRunnerTests(unittest.TestCase):
         self.assertEqual(plan["stdin_payload_size_bytes"], len(payload))
         self.assertLess(sum(len(argument) + 1 for argument in plan["ssh_argv"]), 8_192)
 
+    def test_status_ssh_receives_bounded_timeout(self) -> None:
+        def response(*args, **kwargs):
+            if "stdout" in kwargs:
+                kwargs["stdout"].write('{"complete": false}')
+            return subprocess.CompletedProcess([], 0, '{"complete": false}', "")
+
+        with mock.patch.object(RR.subprocess, "run", side_effect=response) as run:
+            RR.fetch_remote_status(self.manifest())
+        self.assertGreater(run.call_args.kwargs.get("timeout", 0), 0)
+
+    def test_ssh_timeout_is_transport_only(self) -> None:
+        with self.assertRaisesRegex(RR.TransportError, "observer/transport timeout"):
+            RR.run_ssh_json([sys.executable, "-c", "import time; time.sleep(0.5)"],
+                              timeout_seconds=0.05)
+
+    def test_poll_passes_remaining_budget_and_bounds_sleep(self) -> None:
+        now = [0.0]
+        budgets = []
+        sleeps = []
+
+        def fetch(timeout=None):
+            budgets.append(timeout)
+            now[0] += 0.4
+            return {"complete": False}
+
+        def sleep(duration):
+            sleeps.append(duration)
+            now[0] += duration
+
+        result = RR.poll_until_terminal(fetch, 2.0, 1.0, sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(budgets, [1.0])
+        self.assertAlmostEqual(sleeps[0], 0.6)
+        self.assertEqual(result["effective_status"], "observer_timeout")
+        self.assertFalse(result["complete"])
+
+    def test_poll_does_not_accept_completion_after_deadline(self) -> None:
+        now = [0.0]
+
+        def fetch(timeout=None):
+            now[0] = 2.0
+            return {"complete": True, "effective_status": "succeeded"}
+
+        result = RR.poll_until_terminal(fetch, 1.0, 1.0, clock=lambda: now[0])
+        self.assertEqual(result["effective_status"], "observer_timeout")
+
+    def test_sync_ssh_receives_bounded_timeout(self) -> None:
+        with mock.patch.object(RR.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 1, b"", b"connection dropped"
+        )) as run:
+            with self.assertRaises(RR.TransportError):
+                RR.sync_remote(self.manifest(), self.root / "synced")
+        self.assertGreater(run.call_args.kwargs.get("timeout", 0), 0)
+
+    def test_launch_timeout_is_unknown_and_never_retried(self) -> None:
+        with mock.patch.object(RR, "load_manifest", return_value=self.manifest()), \
+                mock.patch("builtins.print"), \
+                mock.patch.object(RR.subprocess, "run", side_effect=
+                                  subprocess.TimeoutExpired("ssh", 0.1)) as run:
+            with self.assertRaisesRegex(RR.TransportError, "outcome unknown"):
+                RR.main(["launch", "--manifest", "fixture.json", "--execute",
+                           "--timeout-seconds", "0.1"])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.1)
+
+    def test_ssh_timeout_does_not_drain_descendant_held_pipes(self) -> None:
+        source = ("import subprocess, sys, time; "
+                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.5)']); "
+                  "time.sleep(1)")
+        started = time.monotonic()
+        with self.assertRaisesRegex(RR.TransportError, "observer/transport timeout"):
+            RR.run_ssh_json([sys.executable, "-c", source], 0.05)
+        self.assertLess(time.monotonic() - started, 0.3)
+
+    def test_poll_deadline_leaves_independent_work_running(self) -> None:
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.8)"])
+        try:
+            started = time.monotonic()
+            result = RR.poll_until_terminal(
+                lambda timeout: RR.run_ssh_json(
+                    [sys.executable, "-c", "import time; time.sleep(1)"], timeout
+                ), 1.0, 0.08,
+            )
+            self.assertLess(time.monotonic() - started, 0.4)
+            self.assertEqual(result["effective_status"], "observer_timeout")
+            self.assertFalse(result["complete"])
+            self.assertIsNone(worker.poll())
+            self.assertEqual(worker.wait(timeout=2), 0)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=2)
+
+    def test_poll_budgets_decrease_across_transport_retries(self) -> None:
+        now = [0.0]
+        budgets = []
+
+        def fetch(timeout=None):
+            budgets.append(timeout)
+            now[0] += 0.2
+            raise RR.TransportError("connection dropped")
+
+        result = RR.poll_until_terminal(
+            fetch, 0.3, 1.0, sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+            clock=lambda: now[0],
+        )
+        self.assertEqual(budgets, [1.0, 0.5])
+        self.assertEqual(result["transport_errors"], 2)
+        self.assertEqual(result["effective_status"], "observer_timeout")
+
+    def test_sync_timeout_removes_partial_archive(self) -> None:
+        destination = self.root / "synced"
+        with mock.patch.object(RR.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("ssh", 0.1)):
+            with self.assertRaisesRegex(RR.TransportError, "observer/transport timeout"):
+                RR.sync_remote(self.manifest(), destination, 0.1)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".remote-runner-sync-*")), [])
+
+    def test_observer_rejects_nonfinite_deadlines(self) -> None:
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(RR.SupervisorError):
+                RR.poll_until_terminal(lambda _: {"complete": True}, 1.0, value)
+
     def test_poll_recovers_after_ssh_transport_disconnect(self) -> None:
         manifest = self.manifest()
         state_dir, _ = self.run_task(manifest)
@@ -420,7 +630,7 @@ class RemoteRunnerTests(unittest.TestCase):
             RR.remote_status(state_dir),
         ]
 
-        def fetch() -> Dict[str, Any]:
+        def fetch(timeout: float) -> Dict[str, Any]:
             value = responses.pop(0)
             if isinstance(value, Exception):
                 raise value

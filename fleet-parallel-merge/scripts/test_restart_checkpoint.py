@@ -219,6 +219,63 @@ def flattened_strings(value: object) -> list[str]:
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_legacy_checkpoint_without_ownership_fields_is_not_upgraded(self) -> None:
+        checkpoint = built_checkpoint()
+        for field in ("cursor_owner", "recovery_entry"):
+            legacy = copy.deepcopy(checkpoint)
+            del legacy[field]
+            with self.subTest(missing=field):
+                with self.assertRaisesRegex(CHECKPOINT.ContractError, field):
+                    CHECKPOINT.validate_resume(resume_input(legacy, observed_snapshot(legacy)))
+
+    def test_skill_entry_points_to_dispatch_without_restating_landing_policy(self) -> None:
+        text = (SCRIPT.parent.parent / "SKILL.md").read_text()
+        flat = " ".join(text.split())
+        self.assertIn("`fleet-dispatch`", flat)
+        for copied_gate in ("squashed fast-forward landing", "reviewer PASS", "one squashed",
+                            "ff-only", "optional reviewer", "Dev-phase gate"):
+            self.assertNotIn(copied_gate, flat)
+
+    def test_wave_reference_contracts_defer_user_outcome_to_root(self) -> None:
+        for name in ("multi-writer-protocol.md", "contracts.md"):
+            text = (SCRIPT.parent.parent / "references" / name).read_text()
+            for marker in ("iteration-root-packet", "recovery_entry", "checkpoint_sha256", "resume_existing"):
+                self.assertIn(marker, text, name)
+
+    def test_wave_receipt_defers_foreground_cursor_to_root(self) -> None:
+        checkpoint = built_checkpoint()
+        self.assertEqual(checkpoint.get("cursor_owner"), "iteration-root-packet")
+        self.assertEqual(checkpoint.get("recovery_entry"), {
+            "kind": "resume_validate", "checkpoint_path": CHECKPOINT_PATH,
+        })
+        result = CHECKPOINT.validate_resume(resume_input(checkpoint, observed_snapshot(checkpoint)))
+        self.assertEqual(result.get("checkpoint_sha256"), CHECKPOINT._rendered_sha256(checkpoint))
+        self.assertEqual(result.get("cursor_owner"), "iteration-root-packet")
+
+    def test_wave_resume_rejects_competing_cursor_owner(self) -> None:
+        checkpoint = built_checkpoint()
+        checkpoint["cursor_owner"] = "wave"
+        with self.assertRaisesRegex(CHECKPOINT.ContractError, "cursor_owner"):
+            CHECKPOINT.validate_resume(resume_input(checkpoint, observed_snapshot(checkpoint)))
+
+    def test_wave_resume_rejects_alternate_recovery_entry(self) -> None:
+        checkpoint = built_checkpoint()
+        checkpoint["recovery_entry"] = {"kind": "resume_validate", "checkpoint_path": "/other/checkpoint.json"}
+        with self.assertRaisesRegex(CHECKPOINT.ContractError, "recovery_entry"):
+            CHECKPOINT.validate_resume(resume_input(checkpoint, observed_snapshot(checkpoint)))
+
+    def test_reconstructed_checkpoint_preserves_predecessor_digest(self) -> None:
+        source = checkpoint_input()
+        source["predecessor_checkpoint_sha256"] = "a" * 64
+        checkpoint = CHECKPOINT.build_checkpoint(source)
+        self.assertEqual(checkpoint["predecessor_checkpoint_sha256"], "a" * 64)
+        result = CHECKPOINT.validate_resume(resume_input(checkpoint, observed_snapshot(checkpoint)))
+        self.assertEqual(result["status"], "resume_existing")
+        self.assertEqual(result["checkpoint_sha256"], CHECKPOINT._rendered_sha256(checkpoint))
+        source["predecessor_checkpoint_sha256"] = "bad"
+        with self.assertRaisesRegex(CHECKPOINT.ContractError, "predecessor_checkpoint_sha256"):
+            CHECKPOINT.build_checkpoint(source)
+
     def test_checkpoint_is_deterministic_minimal_and_command_free(self) -> None:
         source = checkpoint_input()
         first = CHECKPOINT.build_checkpoint(source)
@@ -647,6 +704,7 @@ class ResumeTests(unittest.TestCase):
         checkpoint = built_checkpoint()
         checkpoint["state_path"] = f"{CORE_ROOT}/state"
         checkpoint["checkpoint_path"] = f"{CORE_ROOT}/state/checkpoint.json"
+        checkpoint["recovery_entry"]["checkpoint_path"] = checkpoint["checkpoint_path"]
         checkpoint["resource_manifest"]["locator"] = (
             f"{CORE_ROOT}/state/resource-manifest.json"
         )

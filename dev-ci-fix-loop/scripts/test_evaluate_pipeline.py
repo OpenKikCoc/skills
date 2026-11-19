@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -375,6 +376,77 @@ class EvaluatePipelineTest(unittest.TestCase):
 
                 self.assertEqual(process.returncode, expected_code, process.stderr)
                 self.assertEqual(json.loads(process.stdout)["state"], expected_state)
+
+
+class WorkflowContractTest(unittest.TestCase):
+    root = MODULE_PATH.parent.parent
+
+    def prose(self, relative_path: str) -> str:
+        return " ".join((self.root / relative_path).read_text().split())
+
+    def test_execution_context_is_per_action_and_not_escape_authority(self) -> None:
+        entry = self.prose("SKILL.md")
+        self.assertIn("credentials per action", entry)
+        self.assertIn("context that will execute that action", entry)
+        self.assertIn("minimal permitted context", entry)
+        self.assertIn("does not authorize escaping the current sandbox", entry)
+        self.assertIn("preserve local work", entry)
+        self.assertNotIn("Run authentication, Git push, and the full pipeline loop", entry)
+
+    def test_delivery_epoch_loads_only_for_frozen_boundary_contract(self) -> None:
+        entry = self.prose("SKILL.md")
+        reference = self.prose("references/delivery-evidence-epoch.md")
+        self.assertIn('A plain "make CI green" task ends with the evaluator', entry)
+        self.assertIn("Only when a frozen delivery contract declares", entry)
+        self.assertIn("generated-artifact or release boundary", entry)
+        self.assertIn("## Contract Scope", reference)
+        self.assertIn("Do not fabricate receipts", reference)
+        self.assertIn("Never drop a required lane", reference)
+        self.assertIn("artifact-only", reference)
+        self.assertIn("all four lanes", reference)
+
+    def test_cli_syntax_comes_from_help_not_memory(self) -> None:
+        entry = self.prose("SKILL.md")
+        self.assertIn("--help", entry)
+        self.assertIn("never from memory", entry)
+
+    def test_documented_packet_and_stdin_interface_remain_consumable(self) -> None:
+        reference = (self.root / "references/github-checks.md").read_text()
+        for phrase in ("Input fields", "Invocation and output", "exits `0`",
+                       "`2`", "unknown, never PASS", "evaluate(packet)",
+                       "query_source", "next_action"):
+            self.assertIn(phrase, reference)
+        samples = re.findall(r"```json\n(.*?)\n```", reference, re.DOTALL)
+        self.assertEqual(len(samples), 1)
+        evidence = json.loads(samples[0])
+        result = evaluate_pipeline.evaluate(evidence)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["failures"][0]["evidence"]["kind"], "step_log")
+        cases = [
+            (evidence, 2, "failed"),
+            (packet(commit_checks=[check("unit")]), 0, "green"),
+            ({"expected_sha": "sha-new"}, 1, None),
+        ]
+        for value, code, state in cases:
+            with self.subTest(state=state):
+                process = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), "-", "--compact"],
+                    input=json.dumps(value), capture_output=True, text=True,
+                    check=False, timeout=5,
+                )
+                self.assertEqual(process.returncode, code, process.stderr)
+                if state is None:
+                    self.assertEqual(process.stdout, "")
+                    self.assertIn("error:", process.stderr)
+                else:
+                    self.assertEqual(json.loads(process.stdout)["state"], state)
+
+    def test_documented_result_keys_match_the_evaluator(self) -> None:
+        reference = (self.root / "references/github-checks.md").read_text()
+        result = evaluate_pipeline.evaluate(packet(commit_checks=[check("unit")]))
+        for key in result:
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", reference)
 
 
 if __name__ == "__main__":

@@ -81,3 +81,51 @@ safety measure only, never a way to deliver a correction faster.
 3. Decide the permission policy.
 4. Run `fleet.py launch <card> --dry-run` and read the argv before the first
    real launch.
+
+## Runtime failover and probes
+
+A platform pass may relaunch a failed worker on another runtime of the same
+fleet (or the same runtime) instead of waiting for a human. Keep it conservative.
+
+**Classify the last error first.** Read the last terminal error of the current
+generation and put it in one class: access restricted (the provider or account
+refuses this model or route), bad session state (an encrypted or stale
+conversation the provider no longer accepts), or capacity (resource exhausted,
+stream cut off, overloaded). The class picks the target: access restricted and
+bad session state move to another runtime or fresh session; capacity moves to
+the alternative runtime that is not itself down.
+
+**When it may fail over.** All of these must hold:
+
+- the item is live and its HANDOFF state is `in-progress` (never
+  `awaiting-verify`, `blocked`, or terminal);
+- the session is not active or queued with the provider;
+- the error is between 20 seconds and 1 hour old (younger may still recover,
+  older is already someone else's problem);
+- no more than 3 failovers for this card in the last hour, with backoff 0, 120,
+  then 600 seconds between attempts;
+- the target runtime was not verified down in the last 30 minutes (a recent
+  failed probe means wait, not retry elsewhere).
+
+**Reviewers never fail over.** A reviewer's verdict is bound to its own session;
+the platform wakes the coordinator with the target runtime and the coordinator
+launches a new reviewer.
+
+**A rejected cross-runtime move does not count.** If the launch gate refuses the
+move (for example the source session is idle but not provably dead, or the
+observations are stale), it is neither an attempt nor a failure for the hourly
+cap. Record it as deferred, back off, and when the refusal came from missing or
+stale observations fall back to a same-runtime relaunch once the source runtime's
+down marker expires.
+
+**Probe like a real session.** Judge a runtime's availability with one trivial
+turn (a read-only "reply OK" prompt) sent through the same server path the
+fleet uses, not a bare CLI invocation: a CLI one-shot can hang while the
+server path is healthy, or the reverse. A probe writes no registry rows, no
+HANDOFF, and no worktree, and it is archived afterwards on a best-effort basis.
+
+**Preview and rollback.** Ship a read-only preview that prints, per candidate,
+the error class, target, age, and the decision (relaunch, wake the coordinator,
+skip with the HANDOFF state, cap reached, deferred for backoff or target down)
+and writes nothing. Control the whole feature with one flag that every pass
+re-reads, so turning it off needs no restart.

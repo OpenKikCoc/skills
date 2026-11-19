@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
@@ -1717,7 +1718,7 @@ class GuardedGoTests(unittest.TestCase):
                 mock.patch.object(guarded_go, "process_group_present", return_value=True):
             self.assertEqual(guarded_go.inspect_process(expected, group=True)["status"], "unknown")
 
-    def test_cross_pid_namespace_is_unknown_and_not_reconcilable(self):
+    def cross_namespace_record(self):
         _, record = self.reserve()
         namespace_a = {
             "schema_version": 1, "pid": record["owner_pid"], "uid": os.getuid(),
@@ -1732,18 +1733,102 @@ class GuardedGoTests(unittest.TestCase):
         guarded_go.hygiene.atomic_write_json(self.state / "budget.json", ledger)
         observer = dict(namespace_a, pid=os.getpid(), process_group_id=os.getpgrp(),
                         pid_namespace="pid:[200]")
+        return record, observer
+
+    def fake_proc(self, processes, observer_nspid="4242", init=True):
+        """Build a /proc stand-in: (pid, ns/pid link, NSpid[, uid]) per process."""
+        proc = Path(tempfile.mkdtemp(dir=self.root))
+        (proc / "self").mkdir()
+        (proc / "self/status").write_text(f"Name:\tpython3\nNSpid:\t{observer_nspid}\n")
+        for pid, namespace, nspid, *uid in ((("1", "pid:[200]", "1", 0),) if init else ()) + tuple(processes):
+            uid = uid[0] if uid else os.getuid()
+            (proc / pid / "ns").mkdir(parents=True)
+            os.symlink(namespace, proc / pid / "ns/pid")
+            (proc / pid / "status").write_text(
+                f"Name:\tproc\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nNSpid:\t{nspid}\n"
+            )
+        return proc
+
+    @contextlib.contextmanager
+    def cross_namespace_status(self, observer, proc, readlink_errors=None):
+        real_readlink = os.readlink
+        errors = readlink_errors or {}
+
+        def readlink(path):
+            error = errors.get(Path(path).parent.parent.name)
+            if error is not None:
+                raise error
+            return real_readlink(path)
+
         with mock.patch.object(guarded_go, "capture_process_identity", return_value=observer), \
+                mock.patch.object(guarded_go, "PROC_ROOT", proc), \
+                mock.patch.object(guarded_go.os, "readlink", side_effect=readlink), \
                 mock.patch.object(guarded_go, "process_group_present") as group_probe:
-            status = guarded_go.budget_status(self.state)
-            rendered = status["reservations"][0]
-            self.assertEqual(rendered["owner_liveness"], {
-                "status": "unknown", "reason": "pid_namespace_not_comparable",
-            })
-            self.assertEqual(rendered["child_liveness"]["status"], "unknown")
-            self.assertEqual(rendered["reconcile_class"], "owner_unknown")
-            with self.assertRaisesRegex(guarded_go.hygiene.HygieneError, "owner_unknown"):
-                guarded_go.reconcile(self.state, record["id"], rendered["record_sha256"])
+            yield guarded_go.budget_status(self.state)["reservations"][0]
             group_probe.assert_not_called()
+
+    def assert_cross_namespace_unknown(self, record, rendered):
+        self.assertEqual(rendered["owner_liveness"], {
+            "status": "unknown", "reason": "pid_namespace_not_comparable",
+        })
+        self.assertEqual(rendered["child_liveness"]["status"], "unknown")
+        self.assertEqual(rendered["reconcile_class"], "owner_unknown")
+        with self.assertRaisesRegex(guarded_go.hygiene.HygieneError, "owner_unknown"):
+            guarded_go.reconcile(self.state, record["id"], rendered["record_sha256"])
+
+    def test_cross_pid_namespace_is_unknown_and_not_reconcilable(self):
+        record, observer = self.cross_namespace_record()
+        proc = self.fake_proc([("4242", "pid:[200]", "4242"), ("5000", "pid:[100]", "5000\t7")])
+        with self.cross_namespace_status(observer, proc) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
+
+    def test_gone_pid_namespace_is_dead_and_reconcilable(self):
+        record, observer = self.cross_namespace_record()
+        tmp = self.state / "tmp" / record["id"]
+        tmp.mkdir()
+        (tmp / "evidence").write_text("keep")
+        proc = self.fake_proc([
+            ("4242", "pid:[200]", "4242"), ("5001", "pid:[300]", "5001\t3"),
+            ("6000", "pid:[200]", "6000"), ("7000", "pid:[400]", "7000\t1", 0),
+        ])
+        # Unreadable links are excluded only for host-level or other-uid processes.
+        unreadable = {"6000": PermissionError(13, "denied"), "7000": PermissionError(13, "denied")}
+        with self.cross_namespace_status(observer, proc, unreadable) as rendered:
+            gone = {"status": "dead", "reason": "pid_namespace_gone"}
+            self.assertEqual(rendered["owner_liveness"], gone)
+            self.assertEqual(rendered["child_liveness"], gone)
+            self.assertEqual(rendered["reconcile_class"], "eligible")
+            with self.assertRaisesRegex(guarded_go.hygiene.HygieneError, "digest"):
+                guarded_go.reconcile(self.state, record["id"], "0" * 64)
+            result = guarded_go.reconcile(self.state, record["id"], rendered["record_sha256"])
+            self.assertEqual(result["status"], "budget_reconciled")
+        self.assertEqual(guarded_go.budget_status(self.state)["reserved_bytes"], 0)
+        self.assertEqual((tmp / "evidence").read_text(), "keep")
+
+    def test_unreadable_pid_namespace_link_is_unknown(self):
+        record, observer = self.cross_namespace_record()
+        proc = self.fake_proc([("4242", "pid:[200]", "4242"), ("5000", "pid:[300]", "5000\t7")])
+        same_uid_nested = {"5000": PermissionError(13, "denied")}
+        with self.cross_namespace_status(observer, proc, same_uid_nested) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
+        (proc / "5000/status").write_text("Name:\tproc\nNSpid:\t5000\t7\n")
+        with self.cross_namespace_status(observer, proc, same_uid_nested) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
+        io_error = {"4242": OSError(5, "I/O error")}
+        with self.cross_namespace_status(observer, proc, io_error) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
+        vanished = {"5000": FileNotFoundError(2, "gone")}
+        with self.cross_namespace_status(observer, proc, vanished) as rendered:
+            self.assertEqual(rendered["reconcile_class"], "eligible")
+
+    def test_non_root_observer_namespace_is_unknown(self):
+        record, observer = self.cross_namespace_record()
+        proc = self.fake_proc([("4242", "pid:[200]", "4242")], observer_nspid="4242\t9")
+        with self.cross_namespace_status(observer, proc) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
+        hidden = self.fake_proc([("4242", "pid:[200]", "4242")], init=False)
+        with self.cross_namespace_status(observer, hidden) as rendered:
+            self.assert_cross_namespace_unknown(record, rendered)
 
     def test_empty_legacy_ledger_allows_same_root_migration(self):
         before = (self.state / "budget.json").read_bytes()

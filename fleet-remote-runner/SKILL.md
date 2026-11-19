@@ -76,6 +76,14 @@ local machine only to `launch`, `status`, `poll`, and `sync`.
 - `heartbeat_lost`, `stalled_unfinalized`, `timed_out_unfinalized`: report and
   inspect the abnormal state without automatic remediation.
 - `transport_error`: local connectivity failed; the remote task may still run.
+- `observer_timeout`: the local polling deadline expired, not remote completion.
+
+Each local SSH call is bounded by `--timeout-seconds` (default 30). Polling
+with `--max-wait-seconds` passes the remaining monotonic budget to SSH and caps
+sleeps; without it polling may continue, but each connection remains bounded.
+Timeouts close only local SSH, never kill or relaunch remote work. A launch
+timeout leaves an unknown outcome: reconcile its declared state/session first.
+A sync timeout deletes its partial archive and publishes nothing.
 
 Report the task ID, session, effective status, last heartbeat and log progress,
 terminal reason, restoration result, artifact hashes, sync path, and unresolved

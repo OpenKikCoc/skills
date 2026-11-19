@@ -54,7 +54,16 @@ Identity evaluation has four states:
 A numeric PID is inspected only when the observer and recorded Linux boot and
 PID namespace evidence are comparable. A different boot proves the old process
 is gone; a different PID namespace is `unknown` because numeric IDs cannot be
-translated safely. A group-level mismatch is safe only when the comparable
+translated safely, unless the whole recorded namespace is proven gone (`dead`,
+reason `pid_namespace_gone`). That proof requires the observer at the top of
+its `/proc` PID namespace tree (one `NSpid` entry) and a full `/proc` scan in
+which no `ns/pid` link names the recorded namespace. An unreadable link is
+excluded only for a process in the observer's namespace or one running under
+other UIDs only; any other unreadable link, hidden process list (`hidepid`),
+partial `/proc`, or unexpected `/proc` error stays `unknown`. A record from a
+sibling namespace outside the observer's hierarchy would also look gone;
+ledger writers are descendants of the host namespace, so that residual is
+accepted. A group-level mismatch is safe only when the comparable
 recorded group ID is absent. This prevents PID reuse or namespace skew from
 making an unrelated process look like the reservation owner.
 

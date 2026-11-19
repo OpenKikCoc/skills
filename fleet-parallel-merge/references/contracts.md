@@ -298,8 +298,17 @@ The validators keep separate authorities:
   assigned worktree and path anchor;
 - **worker liveness** distinguishes host status from task progress and admits at
   most one unchanged-intent replacement (see [worker-liveness.md](worker-liveness.md));
-- **restart checkpoint** validates durable reconstruction evidence without
-  treating stale worker state as completion.
+- **restart checkpoint** owns Git/resource recovery only: `cursor_owner` names
+  `iteration-root-packet` and `recovery_entry` names the sole `resume_validate`
+  entry for that checkpoint path. The root references its exact bytes and owns
+  user outcome and foreground progression. Resume receipts carry canonical
+  `checkpoint_sha256` and `cursor_owner`; only `resume_existing` without
+  blockers completes root wave recovery. A fresh reconstruction requires a
+  successor checkpoint (same base, plan and current gate) carrying
+  `predecessor_checkpoint_sha256`, followed by fresh validation. Older
+  checkpoints without these fields fail closed and are rebuilt, never upgraded;
+  stale worker state is never completion. See
+  [Restart recovery](multi-writer-protocol.md#restart-recovery).
 
 ### Worker Context Attestation Input
 

@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 function usage() {
   console.log(`Usage:
@@ -25,6 +25,7 @@ Options:
   --expect-active <s=n>      Assert selector count after click; repeatable
   --bound-selector <css>     Major region selector; repeatable
   --text-selector <css>      Text overflow selector; repeatable
+  --timeout-ms <ms>          Total preview deadline, default 30000
   --settle-ms <ms>           Wait after load/click, default 80
   --keep-profile             Keep temporary browser profile
   -h, --help                 Show help
@@ -46,6 +47,7 @@ function parseArgs(argv) {
     width: 817,
     height: 560,
     settleMs: 80,
+    timeoutMs: 30000,
     expectedActive: [],
     boundSelectors: [],
     textSelectors: [],
@@ -94,6 +96,9 @@ function parseArgs(argv) {
     } else if (arg === "--text-selector") {
       args.textSelectors.push(requireValue(argv, i, arg));
       i += 1;
+    } else if (arg === "--timeout-ms") {
+      args.timeoutMs = Number(requireValue(argv, i, arg));
+      i += 1;
     } else if (arg === "--settle-ms") {
       args.settleMs = Number(requireValue(argv, i, arg));
       i += 1;
@@ -110,6 +115,7 @@ function parseArgs(argv) {
     ["width", args.width],
     ["height", args.height],
     ["settle-ms", args.settleMs],
+    ["timeout-ms", args.timeoutMs],
   ]) {
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be positive`);
   }
@@ -168,66 +174,169 @@ async function getFreePort() {
   });
 }
 
-async function waitForJson(url, child, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+function bounded(start, label, { deadline = Infinity, timeoutMs = 5000, signal } = {}) {
+  const budget = Math.min(timeoutMs, deadline - performance.now());
+  return new Promise((resolve, reject) => {
+    let cleanup = () => {};
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const abort = () => finish(signal.reason || new Error(`${label} cancelled`));
+    const timer = setTimeout(() => finish(new Error(`${label} deadline exceeded`)), Math.max(0, budget));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    if (budget <= 0) { finish(new Error(`${label} deadline exceeded`)); return; }
+    try {
+      cleanup = start((value) => finish(null, value), (error) => finish(error)) || cleanup;
+      if (settled) cleanup();
+    } catch (error) { finish(error); }
+  });
+}
+
+function createLifetime(timeoutMs, processImpl = process) {
+  const controller = new AbortController();
+  const deadline = performance.now() + timeoutMs;
+  const interrupt = () => controller.abort(new Error("preview interrupted"));
+  const timer = setTimeout(() => controller.abort(new Error("preview total deadline exceeded")), timeoutMs);
+  processImpl.on("SIGINT", interrupt);
+  processImpl.on("SIGTERM", interrupt);
+  return {
+    deadline, signal: controller.signal,
+    abort: (error) => controller.abort(error),
+    dispose() {
+      clearTimeout(timer);
+      processImpl.removeListener("SIGINT", interrupt);
+      processImpl.removeListener("SIGTERM", interrupt);
+    },
+  };
+}
+
+function delay(ms, limits) {
+  return bounded((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    return () => clearTimeout(timer);
+  }, "preview settle", { ...limits, timeoutMs: ms + 1000 });
+}
+
+async function waitForJson(url, child, timeoutMs = 10000, limits = {}) {
+  const deadline = Math.min(limits.deadline ?? Infinity, performance.now() + timeoutMs);
   let lastError;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
+  while (performance.now() < deadline) {
+    if (limits.signal?.aborted) throw limits.signal.reason;
+    if (child.exitCode !== null || child.signalCode != null) {
       throw new Error(`Chrome exited before DevTools was ready: ${child.exitCode}`);
     }
     try {
-      const response = await fetch(url);
-      if (response.ok) return await response.json();
+      return await bounded((resolve, reject) => {
+        const controller = new AbortController();
+        (limits.fetchImpl || fetch)(url, { signal: controller.signal })
+          .then(async (response) => {
+            if (!response.ok) throw new Error(`DevTools HTTP ${response.status}`);
+            return await response.json();
+          }).then(resolve, reject);
+        return () => controller.abort();
+      }, "DevTools HTTP", { ...limits, deadline, timeoutMs: 1000 });
     } catch (error) {
       lastError = error;
+      if (limits.signal?.aborted) throw limits.signal.reason;
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await delay(Math.min(100, Math.max(0, deadline - performance.now())), { ...limits, deadline });
   }
   throw new Error(`Timed out waiting for DevTools: ${lastError?.message || url}`);
 }
 
-async function connectCdp(webSocketUrl) {
-  const socket = new WebSocket(webSocketUrl);
+async function connectCdp(webSocketUrl, limits = {}) {
+  const socket = new (limits.WebSocketImpl || WebSocket)(webSocketUrl);
   const pending = new Map();
   let nextId = 1;
-
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (!message.id || !pending.has(message.id)) return;
-    const { resolve, reject } = pending.get(message.id);
-    pending.delete(message.id);
-    if (message.error) reject(new Error(JSON.stringify(message.error)));
-    else resolve(message.result);
-  });
-
-  await new Promise((resolve, reject) => {
-    socket.addEventListener("open", resolve, { once: true });
-    socket.addEventListener("error", reject, { once: true });
-  });
+  let failure;
+  const fail = (error) => {
+    failure = error;
+    for (const request of [...pending.values()]) request.reject(error);
+    pending.clear();
+  };
+  const onClose = () => fail(new Error("CDP socket closed"));
+  const onError = () => fail(new Error("CDP socket error"));
+  const onAbort = () => { fail(limits.signal.reason); socket.close(); };
+  const onMessage = (event) => {
+    try {
+      const message = JSON.parse(event.data);
+      const request = pending.get(message.id);
+      if (!request) return;
+      if (message.error) request.reject(new Error(JSON.stringify(message.error)));
+      else request.resolve(message.result);
+    } catch { fail(new Error("CDP invalid message")); }
+  };
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("close", onClose);
+  socket.addEventListener("error", onError);
+  try {
+    await bounded((resolve, reject) => {
+      const closed = () => reject(new Error("CDP socket closed during connect"));
+      const errored = () => reject(new Error("CDP socket error during connect"));
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("close", closed, { once: true });
+      socket.addEventListener("error", errored, { once: true });
+      return () => {
+        socket.removeEventListener("open", resolve);
+        socket.removeEventListener("close", closed);
+        socket.removeEventListener("error", errored);
+      };
+    }, "CDP connect", limits);
+  } catch (error) { socket.close(); throw error; }
+  limits.signal?.addEventListener("abort", onAbort, { once: true });
 
   function send(method, params = {}) {
-    return new Promise((resolve, reject) => {
+    if (failure) return Promise.reject(failure);
+    return bounded((resolve, reject) => {
       const id = nextId++;
       pending.set(id, { resolve, reject });
-      socket.send(JSON.stringify({ id, method, params }));
-    });
+      try { socket.send(JSON.stringify({ id, method, params })); }
+      catch (error) { reject(error); }
+      return () => pending.delete(id);
+    }, `CDP ${method}`, limits);
   }
-
-  return { socket, send };
+  function close() {
+    fail(new Error("CDP connection closed"));
+    limits.signal?.removeEventListener("abort", onAbort);
+    socket.removeEventListener("message", onMessage);
+    socket.removeEventListener("close", onClose);
+    socket.removeEventListener("error", onError);
+    socket.close();
+  }
+  return { socket, send, close };
 }
 
-async function waitForLoad(socket, send, url) {
-  const loaded = new Promise((resolve) => {
+async function waitForLoad(socket, send, url, limits = {}) {
+  let cancel;
+  const loaded = bounded((resolve, reject) => {
+    cancel = reject;
     const listener = (event) => {
-      const message = JSON.parse(event.data);
-      if (message.method !== "Page.loadEventFired") return;
-      socket.removeEventListener("message", listener);
-      resolve();
+      try {
+        const message = JSON.parse(event.data);
+        if (message.method === "Page.loadEventFired") resolve();
+      } catch { reject(new Error("CDP invalid load message")); }
     };
+    const closed = () => reject(new Error("CDP socket closed before load"));
+    const errored = () => reject(new Error("CDP socket error before load"));
     socket.addEventListener("message", listener);
-  });
-  await send("Page.navigate", { url });
-  await loaded;
+    socket.addEventListener("close", closed);
+    socket.addEventListener("error", errored);
+    return () => {
+      socket.removeEventListener("message", listener);
+      socket.removeEventListener("close", closed);
+      socket.removeEventListener("error", errored);
+    };
+  }, "Page load", { timeoutMs: 10000, ...limits });
+  try { await Promise.all([loaded, send("Page.navigate", { url })]); }
+  finally { cancel?.(new Error("Page load cancelled")); }
 }
 
 function evaluationExpression(args) {
@@ -286,6 +395,12 @@ function evaluationExpression(args) {
       }
     }
 
+    const expectedCounts = ${JSON.stringify(args.expectedActive)}.map((item) => ({
+      selector: item.selector,
+      expected: item.count,
+      actual: document.querySelectorAll(item.selector).length
+    }));
+
     const longTokens = [];
     for (const node of uniqueExisting(textSelectors)) {
       const style = getComputedStyle(node);
@@ -297,12 +412,6 @@ function evaluationExpression(args) {
         }
       }
     }
-
-    const expectedCounts = ${JSON.stringify(args.expectedActive)}.map((item) => ({
-      selector: item.selector,
-      expected: item.count,
-      actual: document.querySelectorAll(item.selector).length
-    }));
 
     return {
       title: document.title,
@@ -321,49 +430,101 @@ function evaluationExpression(args) {
   })()`;
 }
 
+// Isolate even regular-file IO: filesystem stalls must not block the deadline timer.
+const fileIoProgram = `
+import fs from "node:fs";
+const [operation, file] = process.argv.slice(1);
+let fd;
+try {
+  const writing = operation === "write";
+  const chunks = [];
+  if (writing) for await (const chunk of process.stdin) chunks.push(chunk);
+  fd = fs.openSync(file, fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY |
+    (writing ? fs.constants.O_WRONLY | fs.constants.O_CREAT : fs.constants.O_RDONLY), 0o666);
+  if (!fs.fstatSync(fd).isFile()) throw new Error("IO target must be a regular file");
+  if (writing) {
+    fs.ftruncateSync(fd, 0);
+    fs.writeFileSync(fd, Buffer.concat(chunks));
+  } else process.stdout.write(fs.readFileSync(fd));
+} catch (error) {
+  console.error(error.message);
+  process.exitCode = 1;
+} finally { if (fd !== undefined) fs.closeSync(fd); }
+`;
+
+async function fileIo(operation, file, data, limits) {
+  return await bounded((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", fileIoProgram, operation, file],
+      { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks = [];
+    let stderr = "";
+    child.stdout.on("data", (chunk) => chunks.push(chunk));
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4096); });
+    child.once("error", reject);
+    child.stdin.on("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`file IO: ${stderr.trim() || "owned IO process failed"}`));
+    });
+    child.stdin.end(data);
+    return () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
+  }, `file IO ${operation}`, { ...limits, timeoutMs: Infinity });
+}
+
 async function main() {
+  const startedAt = performance.now();
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     usage();
     return;
   }
 
-  const htmlPath = path.resolve(args.html);
-  const html = fs.readFileSync(htmlPath, "utf8");
-  if (!/<html[\s>]/i.test(html)) throw new Error("input does not contain an html element");
-  const initScriptPath = args.initScript ? path.resolve(args.initScript) : null;
-  const initScript = initScriptPath
-    ? fs.readFileSync(initScriptPath, "utf8")
-    : null;
-
-  const chrome = findBrowser(args.chrome);
-  if (!chrome) throw new Error("no Chromium found; pass --chrome or set HTML_BOX_BROWSER");
-  const port = await getFreePort();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "html-box-"));
-  const child = spawn(
-    chrome,
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-default-browser-check",
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profile}`,
-      "about:blank",
-    ],
-    { stdio: ["ignore", "ignore", "pipe"] },
-  );
-
-  let stderr = "";
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString();
-  });
-
+  const lifetime = createLifetime(Math.max(0, startedAt + args.timeoutMs - performance.now()));
+  let child, profile, cdp;
   try {
-    const targets = await waitForJson(`http://127.0.0.1:${port}/json`, child);
+    const htmlPath = path.resolve(args.html);
+    const html = (await fileIo("read", htmlPath, undefined, lifetime)).toString("utf8");
+    if (!/<html[\s>]/i.test(html)) throw new Error("input does not contain an html element");
+    const initScriptPath = args.initScript ? path.resolve(args.initScript) : null;
+    const initScript = initScriptPath
+      ? (await fileIo("read", initScriptPath, undefined, lifetime)).toString("utf8")
+      : null;
+
+    const chrome = findBrowser(args.chrome);
+    if (!chrome) throw new Error("no Chromium found; pass --chrome or set HTML_BOX_BROWSER");
+    const port = await bounded((resolve, reject) => {
+      getFreePort().then(resolve, reject);
+    }, "DevTools port", lifetime);
+    profile = fs.mkdtempSync(path.join(os.tmpdir(), "html-box-"));
+    child = spawn(
+      chrome,
+      [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profile}`,
+        "about:blank",
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+
+    child.once("error", (error) => lifetime.abort(error));
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-65536);
+    });
+    const targets = await waitForJson(`http://127.0.0.1:${port}/json`, child, 10000, lifetime);
     const target = targets.find((item) => item.type === "page");
     assert.ok(target, "Chrome did not expose a page target");
-    const { socket, send } = await connectCdp(target.webSocketDebuggerUrl);
+    cdp = await connectCdp(target.webSocketDebuggerUrl, lifetime);
+    const { socket, send } = cdp;
 
     await send("Page.enable");
     await send("Runtime.enable");
@@ -378,8 +539,8 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: false,
     });
-    await waitForLoad(socket, send, pathToFileURL(htmlPath).href);
-    await new Promise((resolve) => setTimeout(resolve, args.settleMs));
+    await waitForLoad(socket, send, pathToFileURL(htmlPath).href, lifetime);
+    await delay(args.settleMs, lifetime);
 
     const evaluated = await send("Runtime.evaluate", {
       returnByValue: true,
@@ -417,10 +578,8 @@ async function main() {
         format: "png",
         fromSurface: true,
       });
-      fs.writeFileSync(
-        path.resolve(args.screenshot),
-        Buffer.from(screenshot.data, "base64"),
-      );
+      await fileIo("write", path.resolve(args.screenshot),
+        Buffer.from(screenshot.data, "base64"), lifetime);
     }
 
     const finalReport = {
@@ -431,40 +590,51 @@ async function main() {
       screenshot: args.screenshot ? path.resolve(args.screenshot) : null,
     };
     if (args.report) {
-      fs.writeFileSync(
-        path.resolve(args.report),
-        `${JSON.stringify(finalReport, null, 2)}\n`,
-      );
+      await fileIo("write", path.resolve(args.report),
+        `${JSON.stringify(finalReport, null, 2)}\n`, lifetime);
     }
     process.stdout.write(`${JSON.stringify(finalReport, null, 2)}\n`);
-    socket.close();
   } finally {
-    await new Promise((resolve) => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        resolve();
-        return;
+    try {
+      try { cdp?.close(); }
+      finally {
+        try { if (child) await stopChrome(child); }
+        finally { if (profile && !args.keepProfile) fs.rmSync(profile, { recursive: true, force: true }); }
       }
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve();
-      };
-      const timer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
-        }
-        finish();
-      }, 1500);
-      child.once("exit", finish);
-      child.kill("SIGTERM");
-    });
-    if (!args.keepProfile) fs.rmSync(profile, { recursive: true, force: true });
+    } finally { lifetime.dispose(); }
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+async function stopChrome(child, graceMs = 1500) {
+  await new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      finish();
+    }, graceMs);
+    child.once("exit", finish);
+    child.kill("SIGTERM");
+  });
+  child.stderr?.destroy();
+}
+
+export { bounded, connectCdp, createLifetime, delay, stopChrome, waitForJson, waitForLoad };
+
+if (process.argv[1] && fs.existsSync(process.argv[1]) &&
+    fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   try {
     await main();
   } catch (error) {

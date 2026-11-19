@@ -3,6 +3,7 @@
 ## Contents
 
 1. Choose the authoring route
+1b. Choose the representation
 2. Choose the interaction pattern
 3. Synthesis-first, no-click gate
 4. Generation contract
@@ -22,6 +23,23 @@ you; an automation surface needs exact bytes archived and compared. If the
 host rewrites HTML on save (minifies, re-indents, strips attributes), hash
 comparison will fail by design: compare a normalized form you define and
 record that rule in the manifest notes.
+
+## 1b. Choose the representation before the validator
+
+Decide what the host will render before running any checker:
+
+| Content | Representation |
+|---|---|
+| Plain self-contained HTML that reflows (cards, tables, tabs, click-to-reveal) | the host's native auto-height HTML block, if it has one: flow layout, no fixed canvas, check at the narrowest and widest column width the host can produce |
+| A fixed canvas (diagram with absolute positions, simulation, chart with exact geometry) | a fixed-viewport box (this skill's templates and exact-viewport preview) |
+| Needs a host action or page context | fixed canvas plus the host bridge, feature-detected, only when the capability is truly required |
+
+Using a fixed canvas for content that reflows costs a clipped or letterboxed
+render at other widths; using flow layout for a fixed-geometry diagram breaks
+its connectors. Pick first, then validate with the checker that matches: the
+exact-viewport check applies to fixed canvases; for flow layout run the
+responsive width check (preview at several `--width` values with a tall
+`--height`, so only horizontal overflow or clipping can fail it).
 
 ## 2. Choose the interaction pattern
 

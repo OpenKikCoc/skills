@@ -44,6 +44,10 @@ concerns is a REWORK. The reviewer never edits the candidate and never changes
 the item's state. The verdict is bound to the SHA and manifest hash: any new
 commit or manifest edit invalidates it.
 
+Reviewers follow `dev-code-review` for finding quality. A green CI result does
+not override a reproduced invariant violation: if the reviewer reproduced it,
+the verdict is REWORK whatever the pipeline says.
+
 Converge: review for real defects (wrong results, data loss, security, broken
 functionality), not style. A second review round looks only at the rework.
 
@@ -70,3 +74,48 @@ A phase whose result is unknown (e.g. the push timed out) becomes
 only inspects the remote: it records `landed` if the base now equals the SHA,
 or `not_landed` (after which a new `land` is allowed). It never re-runs the
 push. Then `mark ITEM done`.
+
+## 4. Completing without a land: `complete-verified`
+
+`land` needs a candidate that is one commit above the base, so two finished
+card shapes close through the coordinator-only
+`fleet.py complete-verified ITEM --kind noncode|already-integrated`. Plain
+`mark done` is refused for a non-code card (`repo: -`); this command is its only
+way to `done`. Both kinds first require the same checks as a reviewer launch:
+a live item, a registered contract hash, `verify` passing, and the HANDOFF
+state `awaiting-verify`.
+
+```bash
+fleet.py complete-verified N-3 --kind noncode [--coordinator-verdict "<one line>"] [--dry-run]
+fleet.py complete-verified W-7 --kind already-integrated --candidate-sha <40-hex> [--dry-run]
+fleet.py complete-verified N-3 --kind noncode --reconcile
+```
+
+**`noncode`** (a card without a repo):
+
+- every manifest path is re-hashed inside the work directory; a path that is
+  a symlink, or goes through one, is refused, and at least one `artifact` or
+  `report` with a path must exist;
+- the verdict is a reviewer PASS bound to the current manifest hash, recorded
+  by a reviewer generation whose session differs from every worker session, with
+  no later non-PASS for that manifest;
+- a `--coordinator-verdict` (one line) is accepted only when the item has no
+  reviewer verdict at all. A REWORK from a reviewer is never overridden by it.
+
+**`already-integrated`** (a code card whose candidate adds nothing to the
+base): the candidate equals the manifest commit and the remote branch head, and
+git proves it contributes nothing to `origin/<base>`: it is an ancestor, or every
+`git cherry` mark is `-` (a patch-equivalent commit is already there). A reviewer
+PASS bound to that exact candidate and manifest is required. A candidate that
+still adds changes is refused and must go through `land`; `land` in turn refuses
+a candidate that adds nothing.
+
+**Transaction.** The command persists an `intent` row (with a digest of kind,
+manifest hash, candidate, and verdict basis) before it changes anything, then
+marks the item `done` and records `complete`. A repeat call after `complete` is
+a no-op that reports `noop: true` and writes nothing. If the outcome is unknown
+(a crash after `intent`, or an error while completing) the next call exits 5 and
+refuses to run: the outcome is terminal until `--reconcile`, which only inspects
+the item state and records `complete` (the item is already `done`) or
+`not_completed` (a retry is then allowed). `--dry-run` runs every gate and
+persists nothing.

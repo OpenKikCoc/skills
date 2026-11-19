@@ -7,8 +7,9 @@ description: "Coordinate several repository writers on one change: immutable bas
 
 ## Default path
 
-One task, one worker, one worktree, one squashed fast-forward landing is the
-normal case and belongs to `fleet-dispatch`. Parallelism alone does not
+One task, one worker, one worktree: follow `fleet-dispatch` (its current card
+and mandate own worker/reviewer lifecycle, review, testing and landing policy)
+and do not create this skill's multi-writer packet. Parallelism alone does not
 justify more process. With at most one repository writer (everyone else
 read-only or writing disposable task-local artifacts), record only the base
 SHA, one owner and scope per task, and one acceptance criterion per task. Do

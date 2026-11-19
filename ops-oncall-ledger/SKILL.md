@@ -71,9 +71,19 @@ Tests: `python3 -I scripts/test_ledger.py`.
 - Preserve `unknown` instead of inventing owners, impact, times, or causes.
 - Production remediation is outside this skill; diagnosis does not authorize it.
 
+## Staged writes and dependencies
+
+Treat every external write as an immutable intent with a pre-read, an
+`outcome_unknown` state after any ambiguity, and a reconcile step; absence after
+an unknown outcome is not permission to replay. Before using an external CLI,
+record its version and probe `--help` for each flag; missing guidance stops that
+step. Details: [staged-writes.md](references/staged-writes.md).
+
 ## References
 
 - [ticket-record.md](references/ticket-record.md) - schema and enums.
 - [rca-framework.md](references/rca-framework.md) - RCA sections and method.
 - [weekly-rollup.md](references/weekly-rollup.md) - what the weekly contains,
   metric definitions, idempotence.
+- [staged-writes.md](references/staged-writes.md) - external-write vocabulary
+  mapping and dependency receipt.

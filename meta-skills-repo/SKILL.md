@@ -45,9 +45,17 @@ rerun `validate` after the final edit.
 
 - `SKILL.md` has front matter with `name` equal to the directory name
   (lowercase-hyphen) and a non-empty `description` (at most 1024 characters).
-- Relative Markdown links resolve and stay inside the skill (fenced examples,
-  URLs, and anchors are skipped).
-- No symlinks or stray `._*` files inside a skill.
+- Relative Markdown links resolve and stay inside the skill, reported as
+  `file:line`. `?query` and `#fragment` are stripped before resolving. Fenced
+  code (``` or ~~~, any length of three or more) is skipped without shifting
+  line numbers; URLs and pure anchors are skipped. Single-line reference
+  definitions (`[id]: path`, up to three leading spaces) are checked even when
+  unused. Limits: this is not a full Markdown parser; definitions inside a
+  blockquote or list item, or with the destination on the next line, are not
+  checked.
+- No symlinks or stray `._*` files inside a skill, and no special files (FIFO,
+  socket, device): these are errors, and sync/gate fail closed on them instead
+  of opening them.
 - A `scripts/` directory with Python sources must contain `test_*.py`.
 - No duplicate skill names.
 
@@ -56,12 +64,15 @@ rerun `validate` after the final edit.
 Each mirrored skill directory carries a small marker listing the files this
 tool wrote. Sync then:
 
-- copies only changed files and preserves the executable bit;
+- copies only changed files and preserves the full executable mask (owner,
+  group, other); files are opened without following links and without
+  blocking, and checked to be regular files;
 - prunes only files recorded in the marker that left the source;
 - keeps unknown files and reports them;
 - leaves other skills in the target untouched, and skips targets whose root
   directory does not exist (unless the manifest sets `"create": true`);
-- refuses a symlinked destination;
+- refuses a symlinked destination and any non-regular entry in the mirror
+  (`--force` never writes through one);
 - refuses to overwrite a pre-existing differing file it did not write, unless
   `--force`.
 
@@ -84,10 +95,32 @@ deny-list entry number, never the term, so CI logs stay clean.
   pipelines so an absent list cannot pass silently.
 - `--history` also scans git author names and commit messages.
 - Built-in checks regardless of the list: absolute home-directory paths,
-  private-key blocks, literal secret assignments.
+  private-key blocks, quoted secret assignments, unquoted assignments with a
+  token-like value, `Bearer`/`Basic` credentials, and
+  secret query parameters (`?token=`, `access_token=`, `refresh_token=`,
+  `key=`). Placeholders (`${VAR}`, `<value>`) are allowed. Findings name the
+  line and class, never the matched text. A same-line `skills-repo: allow-test-secret`
+  comment exempts an obviously synthetic fixture, only in `test_*.py` and never
+  for private keys or quoted literals.
+- Optional `expected_origin` in the manifest (a remote URL or canonical
+  `host/owner/repo`): `gate`, `sync`, and `reproduce` refuse to run unless
+  `git rev-parse --show-toplevel` equals `--repo` and `origin` normalizes to the
+  same identity. Host case is ignored, path case is not; `.git` and a trailing
+  `/` are stripped; local paths, whitespace, `?`, `#`, backslashes, embedded
+  passwords, bad ports, `.`/`..`/`%` parts, and fewer than two path segments are
+  rejected. Without a git checkout or `origin`, it fails closed.
 
 A clean gate is necessary, not sufficient: the deny list only knows what you
 told it. Also read the diff.
+
+## Vendor guidance reference
+
+When a skill depends on guidance shipped inside a CLI (a vendor guidance
+reference), never copy that text into this repository. Name the exact read
+command, record its version (`<cli> --version`) where the skill depends on it,
+and probe `--help` for the flags in use. If the guidance, a referenced file, or
+the command is missing, stop that dependent step, keep local work, and report
+the dependency gap instead of reconstructing the guidance from memory.
 
 ## Configuration
 

@@ -126,7 +126,48 @@ Status meanings:
 | `partial` | Valid graph exists, but the log reports one or more failed semantic chunks |
 | `failed` | Nonzero exit, missing graph, or invalid graph JSON |
 | `blocked_low_disk` | Free bytes were below `--disk-floor-bytes` before launch |
+| `timed_out` | The per-target deadline expired; the owned process group was stopped |
+| `cancelled` | The coordinator received SIGINT/SIGTERM while the target ran |
+| `unknown_attempt` | A start receipt exists with no terminal receipt; see below |
 | `repaired` | A partial target has a persisted repair fragment and repair audit |
+
+Any status outside `success` and `repaired` is a failure for the exit code,
+the summary, and `audit`.
+
+### Per-target deadline
+
+Every Graphify subprocess (build, and the repair worker) runs in its own
+session with a deadline:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--target-timeout` | 3600 | seconds per target, launcher startup included |
+| `--kill-grace` | 2 | seconds between SIGTERM and SIGKILL |
+
+On expiry the coordinator sends SIGTERM to the process group it created,
+polls until the group is gone or the grace ends, then SIGKILLs that group only;
+unrelated processes are never signalled. The target ends as `timed_out`
+(return code 124). SIGINT/SIGTERM to the coordinator stops running targets the
+same way and records `cancelled`. A deadline or cancellation is never followed
+by an automatic relaunch in the same run; rerun the command deliberately.
+
+Each phase writes receipts under `status/`:
+
+- `<name>.<phase>-start.json`: operation id, process group id, start time,
+  timeout, written before and updated after launch;
+- `<name>.<phase>-terminal.json`: the same operation id plus outcome, return
+  code, finish time, and elapsed seconds;
+- `<name>.<phase>-graphify.json`: the Graphify compatibility receipt for that
+  operation (see Compatibility guard).
+
+A start receipt without a terminal receipt means the coordinator died and the
+attempt's outcome is unknown: its process group may still be running. Build
+refuses such a target (`unknown_attempt`) and `audit` reports it. Check that
+nothing is left in the recorded group, then rerun with `--force`.
+
+Only one coordinator may write an output root: `build` (except `--dry-run`) and
+`repair` hold an exclusive lock on `<output>/.coordinator.lock` and fail fast
+when another coordinator holds it. The lock is released when the process exits.
 
 Build skips `success` and `repaired` targets when their required artifacts
 still exist. It retries `partial`, `failed`, and blocked targets. Use `--force`
@@ -171,6 +212,15 @@ Repair uses the same `--token-budget` as the original build when reconstructing
 chunks. Changing file contents, Graphify detection behavior, excludes, or the
 token budget can change chunk boundaries; in that case rebuild instead of
 replaying stale indexes.
+
+Repair runs each target in a dedicated worker subprocess (the hidden
+`fleet _repair-target` subcommand, started through the launcher) under the same
+`--target-timeout` / `--kill-grace` deadline. After the worker exits zero the
+coordinator verifies, bound to that operation id, the compatibility receipt,
+the fragment, the repair audit, the target status, that every requested chunk is
+covered, and that the audit's added node/edge/hyperedge counts equal the
+fragment. Anything missing, stale, or inconsistent is a failure; exit zero alone
+is never accepted.
 
 Repair does not rewrite `graph.json`. It accumulates only unique additions
 across repeated repair invocations:
@@ -224,12 +274,16 @@ plus size of every input and both outputs.
 ├── repair-summary.json
 ├── merge-audit.json
 ├── audit.json
+├── .coordinator.lock
 ├── fleet-graph.json
 ├── fleet-query-graph.json
 ├── logs/
 │   └── <name>.log
 ├── status/
-│   └── <name>.json
+│   ├── <name>.json
+│   ├── <name>.<phase>-start.json
+│   ├── <name>.<phase>-terminal.json
+│   └── <name>.<phase>-graphify.json
 └── targets/
     └── <name>/
         └── graphify-out/
@@ -255,7 +309,8 @@ scripts/graphify-fleet fleet audit \
 Audit fails when:
 
 - a selected target lacks status or `graph.json`;
-- a target remains failed, partial, or disk-blocked;
+- a target remains failed, partial, timed out, cancelled, unknown, or disk-blocked;
+- a start receipt has no terminal receipt;
 - failed chunk log entries have no repaired status;
 - a repaired target lacks its fragment;
 - the compact graph is absent or not strictly below its configured limit;
@@ -278,6 +333,7 @@ python3 -I scripts/test_fleet_index.py
 
 It uses a fake Graphify launcher and covers zero-exit failed chunks, resume,
 low disk, cumulative repair fragments, force-rebuild cleanup, output-path
-collisions, stale compact rejection, compact limits, and fail-closed atomic
+collisions, per-target deadlines and owned-group kill, start/terminal receipts,
+cancellation, single-coordinator lock, repair result verification, stale compact rejection, compact limits, and fail-closed atomic
 publication.
 It performs no network calls and does not read real credentials.

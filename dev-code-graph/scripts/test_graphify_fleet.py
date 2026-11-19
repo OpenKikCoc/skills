@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import importlib.metadata
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -374,19 +377,32 @@ class StubServerTest(unittest.TestCase):
 
 
 class GraphifyIntegrationTest(unittest.TestCase):
-    def fake_graphify(self):
+    def setUp(self):
+        distribution = types.SimpleNamespace(
+            version="fixture-1",
+            metadata={"Name": "graphify", "Home-page": "https://example.test/graphify"},
+            read_text=lambda name: None,
+        )
+        patcher = mock.patch.object(importlib.metadata, "distribution", return_value=distribution)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_graphify(self, repair=False):
         original_calls = []
 
-        def original(*args, **kwargs):
-            original_calls.append(kwargs)
+        def original(files, backend="kimi", api_key=None, model=None, root=Path("."), *, deep_mode=False):
+            original_calls.append({"backend": backend})
             return {"original": True}
 
         llm = types.ModuleType("graphify.llm")
+        llm.__file__ = str(MODULE_PATH)
         llm.BACKENDS = {}
         llm.extract_files_direct = original
         llm._read_files = lambda files, root: "file content"
         llm._extraction_system = lambda deep=False: "deep system" if deep else "system"
-        llm._parse_llm_json = json.loads
+        llm._parse_llm_json = lambda content: json.loads(content)
+        llm._pack_chunks_by_tokens = lambda files, token_budget=12000: []
+        llm._extract_with_adaptive_retry = lambda files, backend, api_key, model, root, max_depth: {}
         pkg = types.ModuleType("graphify")
         pkg.llm = llm
         return llm, pkg, original_calls
@@ -420,6 +436,104 @@ class GraphifyIntegrationTest(unittest.TestCase):
         messages = request.call_args.args[1]
         self.assertEqual(messages[0]["content"], "deep system")
         self.assertEqual(messages[1]["content"], "file content")
+
+    def test_private_signatures_and_provenance_are_validated(self):
+        llm, _pkg, _ = self.fake_graphify()
+        receipt = gf.validate_graphify(llm, repair=True)
+        self.assertEqual(receipt["version"], "fixture-1")
+        self.assertEqual(receipt["source"], "https://example.test/graphify")
+        self.assertEqual(len(receipt["module_sha256"]), 64)
+        self.assertIn("_pack_chunks_by_tokens", receipt["signatures"])
+        for name in receipt["signatures"]:
+            broken, _p, _c = self.fake_graphify()
+            setattr(broken, name, lambda: None)
+            with self.subTest(name=name), self.assertRaisesRegex(gf.BackendError, "unsupported Graphify"):
+                gf.validate_graphify(broken, repair=True)
+        variadic, _p, _c = self.fake_graphify()
+        variadic._read_files = lambda *args, **kwargs: ""
+        with self.assertRaisesRegex(gf.BackendError, "unsupported Graphify"):
+            gf.validate_graphify(variadic)
+        with mock.patch.object(importlib.metadata, "distribution",
+                               side_effect=importlib.metadata.PackageNotFoundError("graphify")):
+            with self.assertRaisesRegex(gf.BackendError, "unsupported Graphify"):
+                gf.validate_graphify(llm)
+
+    def test_repair_only_signatures_are_checked_only_for_repair(self):
+        llm, _pkg, _ = self.fake_graphify()
+        del llm._pack_chunks_by_tokens
+        self.assertIn("_read_files", gf.validate_graphify(llm)["signatures"])
+        with self.assertRaisesRegex(gf.BackendError, "unsupported Graphify"):
+            gf.validate_graphify(llm, repair=True)
+
+    def test_unsupported_private_api_does_not_mutate_backend(self):
+        llm, pkg, _ = self.fake_graphify()
+        del llm._read_files
+        before = llm.extract_files_direct
+        with mock.patch.dict(sys.modules, {"graphify": pkg, "graphify.llm": llm}), \
+                mock.patch.object(gf.BackendConfig, "from_env", return_value=make_config()):
+            with self.assertRaisesRegex(gf.BackendError, "unsupported Graphify"):
+                gf.register_graphify_backend()
+        self.assertNotIn(gf.BACKEND_NAME, llm.BACKENDS)
+        self.assertIs(llm.extract_files_direct, before)
+
+    def test_registration_is_idempotent_and_does_not_stack_wrappers(self):
+        llm, pkg, calls = self.fake_graphify()
+        pristine = llm.extract_files_direct
+        with mock.patch.dict(sys.modules, {"graphify": pkg, "graphify.llm": llm}), \
+                mock.patch.object(gf.BackendConfig, "from_env", return_value=make_config()):
+            gf.register_graphify_backend()
+            first = llm.extract_files_direct
+            gf.register_graphify_backend()
+            second = llm.extract_files_direct
+            self.assertIsNot(first, pristine)
+            self.assertIs(llm._fleet_original_extract_files_direct, pristine)
+            self.assertEqual(llm.extract_files_direct([], backend="kimi"), {"original": True})
+        self.assertEqual(len(calls), 1)
+
+    def test_provenance_receipt_strips_url_credentials_and_never_serializes_secrets(self):
+        key = "synthetic-" + "signature-key"
+
+        class UnsafeRepr:
+            def __repr__(self):
+                raise AssertionError("default/annotation repr must not run")
+
+        for default in (key, UnsafeRepr()):
+            with self.subTest(default_type=type(default).__name__), tempfile.TemporaryDirectory() as directory:
+                llm, pkg, _ = self.fake_graphify()
+                llm.extract_files_direct = lambda files, backend="kimi", api_key=default, model=None, root=None, deep_mode=False: {}
+                llm.extract_files_direct.__annotations__ = {"api_key": key if isinstance(default, str) else UnsafeRepr()}
+                path = Path(directory) / "provenance.json"
+                captured = io.StringIO()
+                distribution = types.SimpleNamespace(
+                    version="1", metadata={"Name": "graphify", "Home-page": "x"},
+                    read_text=lambda name: json.dumps({"url": f"https://user:{key}@example.test/g?token={key}#frag"}),
+                )
+                with mock.patch.dict(sys.modules, {"graphify": pkg, "graphify.llm": llm}), \
+                        mock.patch.dict(os.environ, {"GRAPHIFY_COMPAT_RECEIPT": str(path)}), \
+                        mock.patch.object(importlib.metadata, "distribution", return_value=distribution), \
+                        mock.patch.object(gf.BackendConfig, "from_env", return_value=make_config(key=key)), \
+                        contextlib.redirect_stderr(captured):
+                    gf.register_graphify_backend()
+                self.assertNotIn(key, captured.getvalue() + path.read_text())
+                receipt = json.loads(path.read_text())
+                self.assertEqual(receipt["source"], "https://example.test/g")
+                self.assertIn({"name": "api_key", "kind": "POSITIONAL_OR_KEYWORD", "required": False},
+                              receipt["signatures"]["extract_files_direct"])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_compatibility_errors_redact_credentials(self):
+        key = "synthetic-" + "metadata-key"
+        llm, _pkg, _ = self.fake_graphify()
+        distribution = types.SimpleNamespace(
+            version=key, metadata={"Name": key, "Home-page": "https://example.test/" + key},
+            read_text=lambda _: None)
+        with mock.patch.object(importlib.metadata, "distribution", return_value=distribution):
+            self.assertNotIn(key, json.dumps(gf.validate_graphify(llm, secret=key)))
+            with mock.patch.object(gf.inspect, "signature", side_effect=ValueError(key)):
+                with self.assertRaises(gf.BackendError) as error:
+                    gf.validate_graphify(llm, secret=key)
+            self.assertNotIn(key, str(error.exception))
+
 
     def test_extract_adds_backend_flag_unless_given(self):
         with mock.patch.object(gf, "load_env", return_value=None), mock.patch.object(

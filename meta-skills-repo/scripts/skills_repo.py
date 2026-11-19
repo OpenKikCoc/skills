@@ -17,13 +17,17 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+REF_DEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:[ \t]*(<[^>]*>|\S+)")
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MARKER = ".skills-repo-managed.json"
 DEFAULT_IGNORES = [".git", "__pycache__", ".DS_Store", "*.pyc", "*.pyo", MARKER]
 DEFAULT_TARGETS = [
@@ -37,7 +41,20 @@ PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"
 SECRET_ASSIGN_RE = re.compile(
     r"""(?ix)\b(?:password|passwd|token|secret|api[_-]?key)\b\s*[:=]\s*["'][^"'${}<\s]{12,}["']"""
 )
+# Broader built-ins. Placeholders (${VAR}, <...>, $VAR) never match because the value
+# classes exclude "$", "<" and "{". Findings report line and class only, never the text.
+_SECRET_NAMES = r"(?:password|passwd|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)"
+SECRET_UNQUOTED_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])" + _SECRET_NAMES + r"(?![A-Za-z0-9])\s*[:=]\s*"
+    r"(?=[A-Za-z0-9_\-/+=.~]*\d)(?=[A-Za-z0-9_\-/+=.~]*[A-Za-z])[A-Za-z0-9_\-/+=.~]{6,}(?![A-Za-z0-9_\-/+=.~(\[])")
+SECRET_HEADER_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{16,}")
+SECRET_QUERY_RE = re.compile(
+    r"(?i)[?&](?:" + _SECRET_NAMES[3:-1] + r"|key|ak|sig|signature)=(?![<${])"
+    r"(?!(?:redacted|example|placeholder|changeme|your|xxx|value))[^&\s\"'`<>)${}]{8,}")
 DEFAULT_DENY_LIST = ".sensitive-terms.txt"
+# A same-line marker lets a test_*.py file keep an obviously synthetic credential-shaped
+# fixture. It applies only to the broadened checks (not private keys or quoted values).
+TEST_FIXTURE_MARKER = "skills-repo: allow-test-" + "secret"
 
 
 class RepoError(RuntimeError):
@@ -111,6 +128,82 @@ def load_config(args: argparse.Namespace) -> Config:
     return Config(repo, Path(args.home).expanduser(), manifest)
 
 
+# ------------------------------------------------------------ origin identity
+
+def canonical_origin_identity(value: str) -> str:
+    """Normalize an ssh/https/http/scp-style remote to ``host/path`` or raise RepoError.
+
+    The host is lowercased; the path keeps its case. ``.git`` and trailing ``/`` are
+    stripped. Rejected: local paths, whitespace, ``?``/``#``/backslash, embedded
+    passwords, bad ports, ``.``/``..``/empty/``%`` path parts, and fewer than two
+    path segments."""
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw or re.search(r"\s|[\\?#]", raw):
+        raise RepoError("origin identity: empty or contains whitespace, backslash, '?', or '#'")
+    if "://" in raw:
+        try:
+            parsed = urlsplit(raw)
+            if parsed.scheme not in {"https", "http", "ssh"} or not parsed.hostname:
+                raise ValueError("unsupported scheme")
+            if parsed.password is not None:
+                raise ValueError("embedded password")
+            parsed.port  # raises ValueError on a bad port
+            host, path = parsed.hostname.lower(), parsed.path.removeprefix("/")
+        except ValueError:
+            raise RepoError("origin identity: unsupported or invalid URL") from None
+    else:
+        match = re.fullmatch(r"(?:[^@/:]+@)?([^:/@]+):(.+)", raw)
+        if match is None:
+            raise RepoError("origin identity: must name a remote host (local paths are not identities)")
+        host, path = match.group(1).lower(), match.group(2)
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts):
+        raise RepoError("origin identity: repository path needs at least two clean segments")
+    if not re.fullmatch(r"[a-z0-9.-]+", host) or any("%" in part for part in parts):
+        raise RepoError("origin identity: ambiguous host or percent-encoded path")
+    return "%s/%s" % (host, path)
+
+
+def expected_origin_identity(value: Any) -> str:
+    """Manifest `expected_origin`: a remote URL, scp-style remote, or canonical `host/owner/repo`."""
+    raw = value.strip() if isinstance(value, str) else ""
+    if raw and "://" not in raw and not re.fullmatch(r"(?:[^@/:]+@)?[^:/@]+:.+", raw) \
+            and re.match(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/", raw):
+        raw = "https://" + raw
+    return canonical_origin_identity(raw)
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RepoError("git %s failed in %s" % (args[0], repo.name))
+    return proc.stdout.strip()
+
+
+def check_origin(cfg: Config) -> None:
+    """Optional `expected_origin` in the manifest: refuse to write or publish from a
+    checkout that is not the intended repository. Fails closed; never echoes the raw URL."""
+    expected_raw = cfg.manifest.get("expected_origin")
+    if expected_raw is None:
+        return
+    expected = expected_origin_identity(expected_raw)
+    try:
+        top = Path(_git_output(cfg.repo, "rev-parse", "--show-toplevel")).resolve()
+    except (RepoError, OSError, subprocess.SubprocessError):
+        raise RepoError("expected_origin is set but the repository is not a readable git checkout")
+    if top != cfg.repo:
+        raise RepoError("--repo must be the git top-level of the checkout (origin check)")
+    try:
+        actual = canonical_origin_identity(_git_output(cfg.repo, "remote", "get-url", "origin"))
+    except RepoError:
+        raise RepoError("git origin is missing or not a recognizable remote (expected_origin check)")
+    if actual != expected:
+        raise RepoError("git origin %s does not match expected_origin %s" % (actual, expected))
+
+
 # ---------------------------------------------------------------- validate
 
 def parse_frontmatter(text: str) -> Tuple[Dict[str, str], Optional[str]]:
@@ -140,20 +233,59 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, str], Optional[str]]:
     return meta, None
 
 
+def strip_markdown_fences(text: str) -> str:
+    """Blank out fenced code (``` or ~~~, any length >= 3) but keep every line break,
+    so later checks can report true line numbers. A fence closes only on the same
+    character with at least the opening length; an unterminated fence runs to EOF."""
+    out: List[str] = []
+    marker = ""
+    width = 0
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if marker:
+            if re.fullmatch(r" {0,3}" + re.escape(marker) + "{%d,}[ \\t]*" % width, bare):
+                marker = ""
+            out.append(line[len(bare):] or "")
+            continue
+        opening = FENCE_OPEN_RE.match(bare)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            marker, width = opening.group(1)[0], len(opening.group(1))
+            out.append(line[len(bare):] or "")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def markdown_link_targets(text: str) -> List[Tuple[int, str]]:
+    """(line, destination) for inline links and single-line reference definitions.
+
+    Limits: definitions inside blockquotes or list items, and definitions whose
+    destination sits on the next line, are not checked; this is not a full parser."""
+    text = strip_markdown_fences(text)
+    found: List[Tuple[int, str]] = []
+    for match in LINK_RE.finditer(text):
+        found.append((text.count("\n", 0, match.start()) + 1, match.group(1)))
+    for number, line in enumerate(text.splitlines(), 1):
+        definition = REF_DEF_RE.match(line)
+        if definition:
+            found.append((number, definition.group(1).strip("<>")))
+    return found
+
+
 def check_links(skill: Path, md: Path, errors: List[str]) -> None:
     text = md.read_text(encoding="utf-8", errors="replace")
-    text = re.sub(r"```.*?```", "", text, flags=re.S)  # ignore fenced examples
-    for target in LINK_RE.findall(text):
+    where = md.relative_to(skill.parent)
+    for line, target in markdown_link_targets(text):
         if re.match(r"^(?:[a-z][a-z0-9+.-]*:|#|<)", target, re.I):
             continue
-        rel = target.split("#", 1)[0]
+        rel = target.split("#", 1)[0].split("?", 1)[0]
         if not rel:
             continue
         dest = (md.parent / rel).resolve()
         if not dest.exists():
-            errors.append("%s: broken link: %s" % (md.relative_to(skill.parent), target))
+            errors.append("%s:%d: broken link: %s" % (where, line, target))
         elif skill.resolve() not in dest.parents and dest != skill.resolve():
-            errors.append("%s: link escapes skill directory: %s" % (md.relative_to(skill.parent), target))
+            errors.append("%s:%d: link escapes skill directory: %s" % (where, line, target))
 
 
 def validate_skill(cfg: Config, skill: Path) -> List[str]:
@@ -173,7 +305,7 @@ def validate_skill(cfg: Config, skill: Path) -> List[str]:
         elif len(description) > 1024:
             errors.append("%s/SKILL.md: description over 1024 characters" % label)
     for md in sorted(skill.rglob("*.md")):
-        if not cfg.is_ignored(md.relative_to(skill)):
+        if not cfg.is_ignored(md.relative_to(skill)) and md.is_file() and not md.is_symlink():
             check_links(skill, md, errors)
     for path in sorted(skill.rglob("*")):
         rel = path.relative_to(skill)
@@ -181,6 +313,9 @@ def validate_skill(cfg: Config, skill: Path) -> List[str]:
             errors.append("%s/%s: stray AppleDouble file" % (label, rel))
         if path.is_symlink():
             errors.append("%s/%s: symlinks are not allowed in skills" % (label, rel))
+        kind = special_file_kind(path)
+        if kind:
+            errors.append("%s/%s: special file (%s) is not allowed in skills" % (label, rel, kind))
     scripts = skill / "scripts"
     if scripts.is_dir():
         sources = [p for p in scripts.glob("*.py") if not p.name.startswith("test_")]
@@ -227,15 +362,45 @@ def action_test(cfg: Config, skills: Sequence[Path]) -> int:
 # --------------------------------------------------------------- sync/verify
 
 def file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Hash a regular file. Opens without following symlinks and without blocking on
+    FIFOs, then checks the opened descriptor's type; anything else is an error."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise RepoError("cannot open %s without following links: %s" % (path.name, error.strerror))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RepoError("not a regular file: %s" % path.name)
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
-def source_files(cfg: Config, skill: Path) -> Dict[str, Tuple[str, bool]]:
+def special_file_kind(path: Path) -> Optional[str]:
+    """Return a label for FIFO/socket/device entries (never opens the path)."""
+    mode = path.lstat().st_mode
+    for check, label in ((stat.S_ISFIFO, "FIFO"), (stat.S_ISSOCK, "socket"),
+                         (stat.S_ISCHR, "character device"), (stat.S_ISBLK, "block device")):
+        if check(mode):
+            return label
+    return None
+
+
+def source_files(cfg: Config, skill: Path) -> Dict[str, Tuple[str, int]]:
     files = {}
     for path in sorted(skill.rglob("*")):
         rel = path.relative_to(skill)
-        if path.is_file() and not path.is_symlink() and not cfg.is_ignored(rel):
-            files[rel.as_posix()] = (file_digest(path), bool(path.stat().st_mode & 0o111))
+        if cfg.is_ignored(rel):
+            continue
+        kind = special_file_kind(path)
+        if kind:
+            raise RepoError("%s/%s: special file (%s) is not allowed in a skill" % (skill.name, rel.as_posix(), kind))
+        if path.is_file() and not path.is_symlink():
+            files[rel.as_posix()] = (file_digest(path), path.stat().st_mode & 0o111)
     return files
 
 
@@ -257,13 +422,16 @@ def plan_skill(cfg: Config, skill: Path, dest: Path) -> Dict[str, Any]:
         return plan
     for rel, (digest, executable) in src.items():
         target = dest / rel
-        if not target.exists():
+        if not target.exists() and not target.is_symlink():
             plan["copy"].append(rel)
             continue
-        same = target.is_file() and file_digest(target) == digest and bool(target.stat().st_mode & 0o111) == executable
+        if target.is_symlink() or not stat.S_ISREG(target.lstat().st_mode):
+            plan["conflicts"].append("%s: not a regular file in the mirror; refusing to write through it" % rel)
+            continue
+        same = file_digest(target) == digest and (target.stat().st_mode & 0o111) == executable
         if same:
             continue
-        if rel in managed or (target.is_file() and file_digest(target) == digest):
+        if rel in managed or file_digest(target) == digest:
             plan["copy"].append(rel)
         else:
             plan["conflicts"].append("%s: exists and was not written by this tool" % rel)
@@ -274,7 +442,7 @@ def plan_skill(cfg: Config, skill: Path, dest: Path) -> Dict[str, Any]:
         known = set(src) | set(managed)
         for path in sorted(dest.rglob("*")):
             rel = path.relative_to(dest).as_posix()
-            if path.is_file() and rel not in known and path.name != MARKER:
+            if path.is_file() and not path.is_symlink() and rel not in known and path.name != MARKER:
                 plan["unknown_kept"].append(rel)
     return plan
 
@@ -313,8 +481,11 @@ def action_sync(cfg: Config, skills: Sequence[Path], targets: Sequence[Dict[str,
             dest = root / skill.name
             plan = plan_skill(cfg, skill, dest)
             if plan["conflicts"] and force and not dest.is_symlink():
-                plan["copy"] += [c.split(":", 1)[0] for c in plan["conflicts"] if ":" in c]
-                plan["conflicts"] = []
+                # --force overrides only "exists and was not written by this tool";
+                # it never writes through a symlink, FIFO, or other non-regular entry.
+                forced = [c for c in plan["conflicts"] if c.endswith("was not written by this tool")]
+                plan["copy"] += [c.split(":", 1)[0] for c in forced]
+                plan["conflicts"] = [c for c in plan["conflicts"] if c not in forced]
             for conflict in plan["conflicts"]:
                 print("conflict %s/%s: %s" % (target["id"], skill.name, conflict))
                 exit_code = 1
@@ -345,8 +516,11 @@ def action_verify(cfg: Config, skills: Sequence[Path], targets: Sequence[Dict[st
                 problems += 1
                 continue
             plan = plan_skill(cfg, skill, dest)
-            for rel in plan["copy"] + [c.split(":")[0] for c in plan["conflicts"]]:
+            for rel in plan["copy"]:
                 print("differs %s/%s/%s" % (target["id"], skill.name, rel))
+                problems += 1
+            for conflict in plan["conflicts"]:
+                print("differs %s/%s/%s" % (target["id"], skill.name, conflict))
                 problems += 1
             for rel in plan["remove"]:
                 print("stale %s/%s/%s" % (target["id"], skill.name, rel))
@@ -415,6 +589,10 @@ def scan_sensitive(cfg: Config, deny_path: Optional[Path], history: bool) -> Tup
                 errors.append("%s:%d: private key block" % (rel, lineno))
             if SECRET_ASSIGN_RE.search(line):
                 errors.append("%s:%d: probable literal secret assignment" % (rel, lineno))
+            elif (SECRET_UNQUOTED_RE.search(line) or SECRET_HEADER_RE.search(line)
+                  or SECRET_QUERY_RE.search(line)) and not (
+                      TEST_FIXTURE_MARKER in line and rel.name.startswith("test_") and rel.suffix == ".py"):
+                errors.append("%s:%d: probable credential (header, query parameter, or unquoted assignment)" % (rel, lineno))
     if deny_rel is not None:
         tracked = subprocess.run(["git", "-C", str(cfg.repo), "ls-files", "--error-unmatch", str(deny_rel)],
                                  capture_output=True) if (cfg.repo / ".git").exists() else None
@@ -475,6 +653,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         cfg = load_config(args)
         skills = cfg.skills(args.skill)
+        if args.action in ("gate", "sync", "reproduce"):
+            check_origin(cfg)
         if args.action == "targets":
             for t in cfg.targets(args.target):
                 print("%s\t%s\t%s" % (t["id"], t["path"], "exists" if t["path"].is_dir() else "missing"))

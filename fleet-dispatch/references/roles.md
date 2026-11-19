@@ -55,6 +55,16 @@ Each relaunch starts from the evolved HANDOFF, not from the original card
 alone, and fences the previous generation: its token stops working even if the
 old process is still alive.
 
+**Context relay.** On a relaunch or escalation the launch prompt also carries a
+bounded tail (at most 12,000 characters in total) of the previous generation's
+log: the user and assistant turns and the tool calls, with secrets redacted
+(bearer and basic credentials, `token`/`secret`/`password`/`api_key` assignments,
+query-string secrets, provider key prefixes, private-key blocks, and long opaque
+strings), plus `git diff --stat` against the base. If the log is missing the
+relay is empty and the launch proceeds. The relay is a hint for orientation; the
+HANDOFF stays the only authority, and a session must re-check anything it
+relies on.
+
 ## Independence
 
 Reviewer independence comes from a different session plus evidence binding,

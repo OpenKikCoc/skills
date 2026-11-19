@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import draft_inbox as inbox_mod  # noqa: E402
+from credential_fixtures import BENIGN, CREDENTIAL_KEYS, FIXTURES  # noqa: E402
 
 
 def packet(**over):
@@ -63,7 +64,7 @@ class InboxTests(unittest.TestCase):
             packet(blocking=True),
             packet(evidence=[]),
             packet(target_ref=""),
-            packet(evidence=["token = abcdefghijklmnop1234"]),
+            packet(evidence=["to" + "ken = abcdefghijklmnop1234"]),
             packet(evidence=["see /ho" + "me/alice/notes.txt"]),
             packet(surprise="x"),
         ]
@@ -97,6 +98,94 @@ class InboxTests(unittest.TestCase):
         name = inbox_mod.propose(self.inbox, packet())["draft"]
         with self.assertRaises(inbox_mod.InboxError):
             inbox_mod.decide(self.inbox, name, "rejected", "   ")
+
+    def assert_rejected_without_echo(self, error, text):
+        message = str(error)
+        self.assertNotIn(text, message)
+        for piece in text.replace("=", " ").replace(":", " ").split():
+            if len(piece) >= 12:
+                self.assertNotIn(piece, message)
+
+    def test_shared_fixtures_are_rejected_in_every_packet_field_without_echo(self):
+        for label, text, kind in FIXTURES:
+            for field in ("evidence", "title", "mechanism", "proposed_change", "existing_rule_checked", "origin"):
+                with self.subTest(fixture=label, field=field):
+                    value = [text] if field == "evidence" else text
+                    with self.assertRaises(inbox_mod.InboxError) as raised:
+                        inbox_mod.propose(self.inbox, packet(**{field: value}))
+                    self.assert_rejected_without_echo(raised.exception, text)
+                    self.assertIn(kind, str(raised.exception))
+        self.assertFalse((self.inbox / "drafts").exists())
+
+    def test_credential_text_in_dict_keys_and_nested_values_is_rejected_without_echo(self):
+        for label, text, _ in FIXTURES:
+            with self.subTest(fixture=label, where="unknown-key"):
+                with self.assertRaises(inbox_mod.InboxError) as raised:
+                    inbox_mod.propose(self.inbox, packet(**{text: "x"}))
+                self.assert_rejected_without_echo(raised.exception, text)
+            with self.subTest(fixture=label, where="nested-origin"):
+                with self.assertRaises(inbox_mod.InboxError) as raised:
+                    inbox_mod.propose(self.inbox, packet(origin={"a": [{"b": text}]}))
+                self.assert_rejected_without_echo(raised.exception, text)
+        for key in CREDENTIAL_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaises(inbox_mod.InboxError) as raised:
+                    inbox_mod.propose(self.inbox, packet(origin={key: "x"}))
+                self.assertIn("credential-field-name", str(raised.exception))
+
+    def test_placeholders_and_plain_prose_are_not_rejected(self):
+        for index, text in enumerate(BENIGN):
+            with self.subTest(text=text):
+                created = inbox_mod.propose(self.inbox, packet(proposed_change="Benign change %d: %s" % (index, text)))
+                self.assertEqual(created["status"], "created")
+
+    def test_shared_fixtures_are_rejected_in_decision_notes_without_echo(self):
+        name = inbox_mod.propose(self.inbox, packet())["draft"]
+        for label, text, _ in FIXTURES:
+            with self.subTest(fixture=label):
+                with self.assertRaises(inbox_mod.InboxError) as raised:
+                    inbox_mod.decide(self.inbox, name, "rejected", "note " + text)
+                self.assert_rejected_without_echo(raised.exception, text)
+        self.assertFalse((self.inbox / "decisions").exists())
+
+    def test_cli_error_output_never_echoes_the_match(self):
+        pfile = Path(self._tmp.name) / "leak.json"
+        for label, text, _ in FIXTURES:
+            with self.subTest(fixture=label):
+                pfile.write_text(json.dumps(packet(evidence=[text])))
+                code, out, err = self.cli("propose", str(pfile))
+                self.assertEqual(code, 2)
+                self.assertNotIn(text, out + err)
+                self.assertNotIn(text[-12:], out + err)
+
+    def test_read_and_list_paths_reject_credential_text_planted_after_the_fact(self):
+        name = inbox_mod.propose(self.inbox, packet())["draft"]
+        inbox_mod.decide(self.inbox, name, "deferred", "wait")
+        receipt = next((self.inbox / "decisions").iterdir())
+        draft = self.inbox / "drafts" / name
+        clean_draft = draft.read_text()
+        clean_receipt = receipt.read_text()
+        for label, text, _ in FIXTURES:
+            with self.subTest(fixture=label, where="decision"):
+                data = json.loads(clean_receipt)
+                data["note"] = text
+                receipt.write_text(json.dumps(data))
+                rows = inbox_mod.list_drafts(self.inbox)
+                self.assertEqual(rows[0]["status"], "unsafe_decision")
+                self.assertNotIn(text, json.dumps(rows))
+                with self.assertRaises(inbox_mod.InboxError) as raised:
+                    inbox_mod.latest_decision(self.inbox, name)
+                self.assert_rejected_without_echo(raised.exception, text)
+            receipt.write_text(clean_receipt)
+            with self.subTest(fixture=label, where="draft"):
+                data = json.loads(clean_draft)
+                data["title"] = text
+                draft.write_text(json.dumps(data))
+                rows = inbox_mod.list_drafts(self.inbox)
+                self.assertEqual(rows[0]["status"], "unsafe_draft")
+                self.assertNotIn(text, json.dumps(rows))
+            draft.write_text(clean_draft)
+        self.assertEqual(inbox_mod.list_drafts(self.inbox)[0]["status"], "deferred")
 
     def test_cli_paths(self):
         pfile = Path(self._tmp.name) / "p.json"

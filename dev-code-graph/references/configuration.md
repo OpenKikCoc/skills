@@ -45,3 +45,9 @@ before replaying failed chunks.
 The adapter owns transient network retries. The fleet layer adds no second
 retry loop: it records failed chunks as `partial` so they can be repaired
 deterministically. Keep adapter retry tests separate from fleet tests.
+
+## Variables set by the fleet orchestrator
+
+Do not set these by hand: `GRAPHIFY_OUT`, `GRAPHIFY_DISABLE_AST_PARALLEL`,
+`GRAPHIFY_OPERATION_ID` (binds receipts to one attempt) and
+`GRAPHIFY_COMPAT_RECEIPT` (where the Graphify compatibility receipt is written).

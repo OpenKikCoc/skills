@@ -34,6 +34,8 @@ holds depth, `scripts/` holds standard-library tools with their own `test_*.py`.
 | [dev-code-navigation](dev-code-navigation/SKILL.md) | Symbol definitions, callers, and references through Serena MCP, bound to the real worktree |
 | [dev-code-graph](dev-code-graph/SKILL.md) | Graphify knowledge graphs for one or many repositories, with any OpenAI-compatible backend |
 | [dev-disk-budget](dev-disk-budget/SKILL.md) | Budgeted build caches and owned temp roots so parallel sessions do not fill the disk |
+| [dev-code-review](dev-code-review/SKILL.md) | Evidence-first code review: each finding states trigger, mechanism, and effect, reproduced where cheap; posting needs authorization and read-back |
+| [dev-plan-workbench](dev-plan-workbench/SKILL.md) | Write planning and design documents with a durable workspace, independent review lanes, a numbers whitelist, and a lint gate |
 
 ## meta — learning from experience
 

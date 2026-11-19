@@ -12,7 +12,8 @@
     {"id": "other-agent", "path": "~/.other-agent/skills", "create": true}
   ],
   "ignore": ["*.log", "node_modules"],
-  "deny_list": ".sensitive-terms.txt"
+  "deny_list": ".sensitive-terms.txt",
+  "expected_origin": "github.com/your-org/your-skills"
 }
 ```
 
@@ -24,6 +25,9 @@
 - `ignore`: extra file-name globs excluded from sync and validation, on top
   of `.git`, `__pycache__`, `.DS_Store`, `*.pyc`.
 - `deny_list`: path (relative to the repo) of the sensitive-term file.
+- `expected_origin`: optional identity (`host/owner/repo`, or any ssh/https/scp
+  remote form) that `gate`, `sync`, and `reproduce` require the checkout's
+  `origin` to match.
 
 Suggested `.gitignore` entries: `.sensitive-terms.txt`, `__pycache__/`.
 

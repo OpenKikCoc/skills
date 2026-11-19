@@ -118,6 +118,45 @@ test("archive CLI round trip", () => {
   assert.equal(JSON.parse(r.stdout).ok, true);
 });
 
+test("archive pins the old box to the approved source hash", () => {
+  const script = path.join(here, "archive-html-box.mjs");
+  const html = good();
+  const file = path.join(tmp, "old.html");
+  fs.writeFileSync(file, html);
+  const okDir = path.join(tmp, "pin-ok");
+  let r = spawnSync("node", [script, "archive", "--html", file, "--out", okDir, "--expect-old-sha256", sha256(html)], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const badDir = path.join(tmp, "pin-bad");
+  r = spawnSync("node", [script, "archive", "--html", file, "--out", badDir, "--expect-old-sha256", sha256(`${html}\n`)], { encoding: "utf8" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /does not match the approved/);
+  assert.equal(fs.existsSync(badDir), false, "mismatch must not write an archive");
+  r = spawnSync("node", [script, "archive", "--html", file, "--out", badDir, "--expect-old-sha256", "abc"], { encoding: "utf8" });
+  assert.match(r.stderr, /64 lowercase hex/);
+  const record = path.join(tmp, "record.json");
+  fs.writeFileSync(record, JSON.stringify({ result: { html } }));
+  r = spawnSync("node", [script, "extract", "--json", record, "--field", "result.html", "--out", badDir, "--expect-old-sha256", "0".repeat(64)], { encoding: "utf8" });
+  assert.notEqual(r.status, 0);
+  assert.equal(fs.existsSync(badDir), false);
+});
+
+test("archive rejects empty, symlink and non-regular sources", () => {
+  const script = path.join(here, "archive-html-box.mjs");
+  const empty = path.join(tmp, "empty.html");
+  fs.writeFileSync(empty, "  \n");
+  const real = path.join(tmp, "real.html");
+  fs.writeFileSync(real, good());
+  const link = path.join(tmp, "link.html");
+  fs.symlinkSync(real, link);
+  for (const [src, pattern] of [[empty, /empty/], [link, /symlink/], [tmp, /regular file/]]) {
+    const out = path.join(tmp, "reject-out");
+    const r = spawnSync("node", [script, "archive", "--html", src, "--out", out], { encoding: "utf8" });
+    assert.notEqual(r.status, 0, src);
+    assert.match(r.stderr, pattern);
+    assert.equal(fs.existsSync(out), false);
+  }
+});
+
 const browser = findBrowser();
 test("preview renders the plain template with no overflow", { skip: browser ? false : "no Chromium found" }, () => {
   const script = path.join(here, "preview-html-box.mjs");

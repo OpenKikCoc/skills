@@ -59,6 +59,7 @@ that would require it. Reuse one owner for recurring invariant mechanisms.
 | Claiming a performance delta | [exact-sha-benchmark-contract.md](references/exact-sha-benchmark-contract.md) |
 | Attributing a regression across runs or releases | [validation-provenance-contract.md](references/validation-provenance-contract.md) |
 | External write may commit despite a lost response | [external-write-transaction-contract.md](references/external-write-transaction-contract.md) |
+| Reporting conclusions, comparisons, contributions or quantified plans (wording vs evidence) | [evidence-calibration-checklist.md](references/evidence-calibration-checklist.md) |
 | Durable long-session packet, compact continuation, recovery | [long-session-control.md](references/long-session-control.md) |
 | Why the long-session protocol is shaped this way (liveness vs accuracy) | [long-session-design.md](references/long-session-design.md) |
 

@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
+import uuid
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, fields
@@ -53,6 +57,7 @@ R = TypeVar("R")
 
 # Must match graphify_fleet.BACKEND_NAME (checked by test_graphify_fleet).
 BACKEND_NAME = "openai-compat"
+CANCELLED = threading.Event()
 
 
 class FleetError(RuntimeError):
@@ -323,6 +328,8 @@ def bounded_map(
         pending: dict[Future[R], T] = {}
 
         def submit_next() -> bool:
+            if CANCELLED.is_set():
+                return False
             try:
                 item = next(iterator)
             except StopIteration:
@@ -563,6 +570,121 @@ def _resumed_result(config: FleetConfig, name: str) -> BuildResult:
     return previous
 
 
+def stop_owned_group(process: subprocess.Popen, grace: float) -> None:
+    def send(sig: int) -> bool:
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+
+    if send(signal.SIGTERM):
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            process.poll()
+            if not send(0):
+                break
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        send(signal.SIGKILL)
+    process.wait(timeout=max(1.0, grace))
+
+
+def run_target_process(config: FleetConfig, name: str, command: list[str],
+                       *, phase: str, timeout: float, grace: float, log_path: Path,
+                       environment_updates: dict[str, str] | None = None) -> dict[str, Any]:
+    if not 0 < timeout < float("inf") or not 0 < grace < float("inf"):
+        raise FleetError("target timeout and kill grace must be finite and positive")
+    started = time.monotonic()
+    receipt = {"name": name, "phase": phase, "operation_id": uuid.uuid4().hex,
+               "started_at": utc_now(), "timeout_seconds": timeout, "status": "starting"}
+    start_path = config.output / "status" / f"{name}.{phase}-start.json"
+    terminal_path = config.output / "status" / f"{name}.{phase}-terminal.json"
+    atomic_write_json(start_path, receipt)
+    process = None
+    try:
+        terminal_path.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.update(environment_updates or {})
+        environment["GRAPHIFY_OUT"] = str(config.target_output(name))
+        environment["GRAPHIFY_DISABLE_AST_PARALLEL"] = "1"
+        environment["GRAPHIFY_COMPAT_RECEIPT"] = str(config.output / "status" / f"{name}.{phase}-graphify.json")
+        environment["GRAPHIFY_OPERATION_ID"] = receipt["operation_id"]
+        Path(environment["GRAPHIFY_COMPAT_RECEIPT"]).unlink(missing_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(f"started_at={receipt['started_at']}\ncommand={shlex.join(command)}\n")
+            log.flush()
+            process = subprocess.Popen(command, cwd=config.root, env=environment,
+                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            receipt.update(status="running", process_group=process.pid)
+            atomic_write_json(start_path, receipt)
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if CANCELLED.is_set():
+                    receipt.update(status="cancelled", return_code=130)
+                    break
+                if remaining <= 0:
+                    receipt.update(status="timed_out", return_code=124)
+                    break
+                try:
+                    receipt["return_code"] = process.wait(timeout=min(0.2, remaining))
+                    receipt["status"] = "exited"
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+    except BaseException:
+        receipt.update(status="cancelled" if process else "failed", return_code=1)
+        raise
+    finally:
+        try:
+            if process is not None:
+                stop_owned_group(process, grace)
+        except Exception:
+            receipt.update(status="cleanup_failed", return_code=1)
+            raise
+        finally:
+            receipt.update(finished_at=utc_now(), elapsed_seconds=round(time.monotonic() - started, 3))
+            atomic_write_json(terminal_path, receipt)
+    return receipt
+
+
+def unknown_attempts(config: FleetConfig, name: str) -> list[str]:
+    """Phases whose start receipt has no terminal receipt (outcome unknown)."""
+    status_dir = config.output / "status"
+    return sorted(
+        start.name[len(name) + 1:-len("-start.json")]
+        for start in status_dir.glob(f"{name}.*-start.json")
+        if start.name[len(name) + 1:-len("-start.json")].isalpha()
+        and not start.with_name(start.name.replace("-start.json", "-terminal.json")).exists()
+    )
+
+
+class CoordinatorLock:
+    """One coordinator per output root; the lock dies with the process."""
+
+    def __init__(self, config: FleetConfig) -> None:
+        self.path = config.output / ".coordinator.lock"
+        self.handle: TextIO | None = None
+
+    def __enter__(self) -> "CoordinatorLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise FleetError(
+                f"another coordinator owns this output root ({self.path})"
+            ) from None
+        self.handle = handle
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
 def build_target(
     config: FleetConfig,
     row: dict[str, Any],
@@ -571,6 +693,20 @@ def build_target(
     name = str(row["name"])
     if not args.force and is_complete(config, name):
         return _resumed_result(config, name)
+    unknown = unknown_attempts(config, name)
+    if unknown and not args.force:
+        result = BuildResult(
+            name=name,
+            status="unknown_attempt",
+            return_code=1,
+            error=(
+                f"previous {'/'.join(unknown)} attempt has a start receipt and no "
+                "terminal receipt; its process group may still run. Verify it is "
+                "gone, then rerun with --force"
+            ),
+        )
+        write_status(config, result)
+        return result
     free_bytes = disk_free_bytes(config.output)
     if free_bytes < args.disk_floor_bytes:
         result = BuildResult(
@@ -591,29 +727,14 @@ def build_target(
     log_path = config.log_path(name)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = build_command(config, row, args)
-    environment = os.environ.copy()
-    environment["GRAPHIFY_OUT"] = str(target_output)
-    environment["GRAPHIFY_DISABLE_AST_PARALLEL"] = "1"
-    environment["GRAPHIFY_LLM_TIMEOUT_SECONDS"] = str(args.api_timeout)
-
-    started = time.monotonic()
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write(f"started_at={utc_now()}\n")
-        log.write(f"command={shlex.join(command)}\n")
-        log.flush()
-        completed = subprocess.run(
-            command,
-            cwd=config.root,
-            env=environment,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    elapsed = round(time.monotonic() - started, 3)
+    write_status(config, BuildResult(name=name, status="running", log_path=str(log_path)))
+    receipt = run_target_process(config, name, command, phase="build",
+                                 timeout=args.target_timeout, grace=args.kill_grace, log_path=log_path,
+                                 environment_updates={"GRAPHIFY_LLM_TIMEOUT_SECONDS": str(args.api_timeout)})
+    elapsed = receipt["elapsed_seconds"]
     graph_path = config.graph_path(name)
     failed_chunks = failed_chunk_indexes(log_path)
-    if completed.returncode == 0 and graph_path.is_file():
+    if receipt["return_code"] == 0 and graph_path.is_file():
         try:
             metrics = parse_graph(graph_path)
         except FleetError as error:
@@ -645,12 +766,12 @@ def build_target(
     else:
         result = BuildResult(
             name=name,
-            status="failed",
+            status=receipt["status"] if receipt["status"] in {"timed_out", "cancelled"} else "failed",
             elapsed_seconds=elapsed,
-            return_code=completed.returncode,
+            return_code=receipt["return_code"],
             log_path=str(log_path),
             failed_chunks=failed_chunks,
-            error="graphify command failed or graph.json is missing",
+            error="target deadline exceeded" if receipt["status"] == "timed_out" else "graphify command failed or graph.json is missing",
         )
     write_status(config, result)
     return result
@@ -692,6 +813,13 @@ def write_build_summary(
 
 
 def build(config: FleetConfig, args: argparse.Namespace) -> int:
+    if args.dry_run:
+        return _build_run(config, args)
+    with CoordinatorLock(config):
+        return _build_run(config, args)
+
+
+def _build_run(config: FleetConfig, args: argparse.Namespace) -> int:
     rows = select_rows(load_manifest(config), args.targets)
     if not rows:
         raise FleetError("no non-empty successful inventory targets selected")
@@ -730,9 +858,9 @@ def build(config: FleetConfig, args: argparse.Namespace) -> int:
         print_build_result(result)
     write_build_summary(config, results, args.disk_floor_bytes)
     return 1 if any(
-        result.status in {"failed", "partial", "blocked_low_disk"}
+        result.status not in {"success", "repaired"}
         for result in results
-    ) else 0
+    ) or CANCELLED.is_set() else 0
 
 
 def stable_key(item: dict[str, Any], kind: str) -> str:
@@ -787,7 +915,7 @@ def prepare_repair_backend() -> None:
             "repair must run through the graphify-fleet launcher"
         ) from error
     load_env()
-    register_graphify_backend()
+    register_graphify_backend(repair=True)
 
 
 def repair_target(
@@ -916,6 +1044,7 @@ def repair_target(
         + output_tokens,
         "repo": name,
         "repair_fragment": True,
+        "operation_id": os.environ.get("GRAPHIFY_OPERATION_ID"),
     }
     atomic_write_json(fragment_path, fragment)
     repair_audit_path = config.repair_audit_path(name)
@@ -952,6 +1081,8 @@ def repair_target(
     )
     audit = {
         "repository": name,
+        "status": "repaired",
+        "operation_id": os.environ.get("GRAPHIFY_OPERATION_ID"),
         "repaired_at": utc_now(),
         "chunk_indexes": cumulative_chunks,
         "total_chunks": len(chunks),
@@ -982,19 +1113,93 @@ def repair_target(
     return {"name": name, "status": "repaired", **audit}
 
 
+def read_repair_graph(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not all(
+        isinstance(data.get(kind, []), list)
+        for kind in ("nodes", "edges", "links", "hyperedges")
+    ) or not any(kind in data for kind in ("nodes", "edges", "links", "hyperedges")):
+        raise FleetError(f"invalid repair graph: {path}")
+    parse_graph(path)
+    return data
+
+
+def verify_repair_result(config: FleetConfig, name: str, receipt: dict[str, Any],
+                         chunks: list[int]) -> dict[str, Any]:
+    operation = receipt["operation_id"]
+    provenance = json.loads((config.output / "status" / f"{name}.repair-graphify.json").read_text(encoding="utf-8"))
+    fragment = read_repair_graph(config.fragment_path(name))
+    result = json.loads(config.repair_audit_path(name).read_text(encoding="utf-8"))
+    status = read_status(config, name)
+    if (receipt["status"] != "exited" or not operation
+            or not all(isinstance(item, dict) and item.get("operation_id") == operation
+                       for item in (provenance, fragment, result))
+            or not all(provenance.get(key) for key in ("package", "version", "source", "module_path", "module_sha256"))
+            or not {"_pack_chunks_by_tokens", "_extract_with_adaptive_retry"}.issubset(provenance.get("signatures", {}))
+            or result.get("status") != "repaired" or result.get("repository") != name
+            or result.get("fragment_path") != str(config.fragment_path(name))
+            or fragment.get("repo") != name or fragment.get("repair_fragment") is not True
+            or not set(chunks).issubset(result.get("chunk_indexes", []))
+            or not result.get("repaired_files")
+            or status is None or status.status != "repaired"
+            or status.repair_fragment != str(config.fragment_path(name))):
+        raise FleetError(f"{name}: repair result is missing or not bound to this operation")
+    for kind in ("nodes", "edges", "hyperedges"):
+        if result.get(f"{kind}_added") != len(fragment.get(kind, [])):
+            raise FleetError(f"{name}: repair audit does not match fragment")
+    return {"name": name, **result}
+
+
 def repair(config: FleetConfig, args: argparse.Namespace) -> int:
+    with CoordinatorLock(config):
+        return _repair_run(config, args)
+
+
+def _repair_run(config: FleetConfig, args: argparse.Namespace) -> int:
     rows = select_rows(load_manifest(config), args.targets)
     if args.chunk and len(rows) != 1:
         raise FleetError("--chunk requires exactly one selected target")
-    prepare_repair_backend()
-    indexes = [value - 1 for value in args.chunk] if args.chunk else None
     results: list[dict[str, Any]] = []
     failures = 0
     for row in sorted(rows, key=lambda item: str(item["name"])):
         try:
-            results.append(
-                repair_target(config, row, indexes, args.token_budget)
-            )
+            name = str(row["name"])
+            if CANCELLED.is_set():
+                failures += 1
+                results.append({"name": name, "status": "cancelled"})
+                continue
+            if not config.graph_path(name).is_file() or not config.log_path(name).is_file():
+                raise FleetError(f"build artifacts are incomplete for target {name}")
+            read_repair_graph(config.graph_path(name))
+            chunks = args.chunk or list(failed_chunk_indexes(config.log_path(name)))
+            if not chunks:
+                results.append({"name": name, "status": "no_failed_chunks"})
+                continue
+            previous = read_status(config, name) or BuildResult(name=name, status="running")
+            previous.status = "running"
+            write_status(config, previous)
+            command = [resolve_launcher(config.launcher), "fleet", "_repair-target",
+                       "--root", str(config.root), "--output", str(config.output),
+                       "--detect-manifest", str(config.detect_manifest), "--no-default-excludes",
+                       "--token-budget", str(args.token_budget), name]
+            for pattern in config.excludes:
+                command.extend(["--exclude", pattern])
+            for chunk in args.chunk or []:
+                command.extend(["--chunk", str(chunk)])
+            receipt = run_target_process(config, name, command, phase="repair",
+                                         timeout=args.target_timeout, grace=args.kill_grace,
+                                         log_path=config.output / "logs" / f"{name}.repair.log")
+            if receipt["return_code"]:
+                status = receipt["status"] if receipt["status"] in {"timed_out", "cancelled"} else "failed"
+                previous = read_status(config, name) or BuildResult(name=name, status=status)
+                previous.status = status
+                previous.return_code = receipt["return_code"]
+                previous.error = "repair target failed or exceeded its deadline"
+                write_status(config, previous)
+                failures += 1
+                results.append({"name": name, "status": status})
+            else:
+                results.append(verify_repair_result(config, name, receipt, chunks))
         except Exception as error:
             failures += 1
             results.append(
@@ -1004,6 +1209,7 @@ def repair(config: FleetConfig, args: argparse.Namespace) -> int:
                     "error": repr(error),
                 }
             )
+            write_status(config, BuildResult(name=str(row["name"]), status="failed", return_code=1, error=str(error)))
             print(f"repair {row['name']}: {error}", file=sys.stderr)
     atomic_write_json(
         config.output / "repair-summary.json",
@@ -1351,7 +1557,7 @@ def audit_fleet(
             issues.append(
                 {"severity": "error", "target": name, "message": "status missing"}
             )
-        elif status.status in {"failed", "partial", "blocked_low_disk"}:
+        elif status.status not in {"success", "repaired"}:
             issues.append(
                 {
                     "severity": "error",
@@ -1378,6 +1584,14 @@ def audit_fleet(
                 issues.append(
                     {"severity": "error", "target": name, "message": str(error)}
                 )
+        for phase in unknown_attempts(config, name):
+            issues.append(
+                {
+                    "severity": "error",
+                    "target": name,
+                    "message": f"unknown {phase} attempt: start receipt without terminal receipt",
+                }
+            )
         failures = failed_chunk_indexes(config.log_path(name))
         target_report["failed_chunks"] = list(failures)
         if failures and (status is None or status.status != "repaired"):
@@ -1653,6 +1867,13 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_deadline_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--target-timeout", type=_positive_int, default=3600,
+                        help="per-target deadline in seconds, including launcher startup")
+    parser.add_argument("--kill-grace", type=_positive_int, default=2,
+                        help="owned process-group TERM grace before KILL")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Portable, resumable Graphify fleet indexing."
@@ -1679,6 +1900,7 @@ def build_parser() -> argparse.ArgumentParser:
         "build", help="build or resume per-target graphs"
     )
     add_common_options(build_parser_)
+    add_deadline_options(build_parser_)
     build_parser_.add_argument("targets", nargs="*")
     build_parser_.add_argument(
         "--parallel", type=_bounded_parallel, default=3
@@ -1707,6 +1929,7 @@ def build_parser() -> argparse.ArgumentParser:
         "repair", help="replay failed semantic chunks into repair fragments"
     )
     add_common_options(repair_parser)
+    add_deadline_options(repair_parser)
     repair_parser.add_argument("targets", nargs="*")
     repair_parser.add_argument(
         "--chunk",
@@ -1717,6 +1940,12 @@ def build_parser() -> argparse.ArgumentParser:
     repair_parser.add_argument(
         "--token-budget", type=_positive_int, default=12000
     )
+
+    worker_parser = subparsers.add_parser("_repair-target", help=argparse.SUPPRESS)
+    add_common_options(worker_parser)
+    worker_parser.add_argument("targets", nargs=1)
+    worker_parser.add_argument("--chunk", action="append", type=_positive_int)
+    worker_parser.add_argument("--token-budget", type=_positive_int, default=12000)
 
     merge_parser = subparsers.add_parser(
         "merge", help="merge per-target graphs and repair fragments"
@@ -1746,7 +1975,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(arguments: list[str] | None = None) -> int:
+def _main(arguments: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(arguments)
     config = make_config(args)
@@ -1756,6 +1985,14 @@ def main(arguments: list[str] | None = None) -> int:
         return build(config, args)
     if args.command == "repair":
         return repair(config, args)
+    if args.command == "_repair-target":
+        prepare_repair_backend()
+        rows = select_rows(load_manifest(config), args.targets)
+        if len(rows) != 1:
+            raise FleetError("repair worker requires exactly one target")
+        indexes = [value - 1 for value in args.chunk] if args.chunk else None
+        repair_target(config, rows[0], indexes, args.token_budget)
+        return 0
     if args.command == "merge":
         return merge(config, args)
     if args.command == "audit":
@@ -1764,9 +2001,22 @@ def main(arguments: list[str] | None = None) -> int:
     return 2
 
 
+def main(arguments: list[str] | None = None) -> int:
+    CANCELLED.clear()
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    for sig in previous:
+        signal.signal(sig, lambda *_args: CANCELLED.set())
+    try:
+        return _main(arguments)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        CANCELLED.clear()
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except FleetError as error:
-        print(f"graphify-fleet: {error}", file=sys.stderr)
+        print(f"graphify-fleet fleet: {error}", file=sys.stderr)
         raise SystemExit(1)

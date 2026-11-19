@@ -1217,5 +1217,575 @@ class TestHostJob(Base):
         self.assertEqual(self.run_cli("host-job", "open", "N-1", "--host", "../x", "--argv", '["x"]', "--human")[0], 1)
 
 
+class NonCode(Base):
+    """Helpers for a finished non-code card."""
+
+    def noncode_ready(self, id="N-1", body=b"x", extra_evidence=None, only=None):
+        c = self.card(id, repo="-", base=None)
+        self.launch(c)
+        wd = os.path.join(self.home, "work", fleet.slugify(id))
+        with open(os.path.join(wd, "out.txt"), "wb") as f:
+            f.write(body)
+        ev = [{"id": "a", "kind": "artifact", "path": "out.txt", "sha256": hashlib.sha256(body).hexdigest()}]
+        if only is not None:
+            ev = only
+        man = {"item": id, "claim": "c", "known_gaps": [], "evidence": ev + (extra_evidence or [])}
+        self.set_noncode_handoff(id, man)
+        return c, wd
+
+    def set_noncode_handoff(self, id, man):
+        hp = os.path.join(self.home, "work", fleet.slugify(id), "HANDOFF.md")
+        t = open(hp).read()
+        t = re.sub(r"^`state:.*$", "`state: awaiting-verify` · `result: ok`", t, flags=re.M)
+        t = re.sub(r"```json\n.*?```", lambda m: "```json\n%s\n```" % json.dumps(man), t, flags=re.S)
+        open(hp, "w").write(t)
+
+    def review(self, c, id, verdict="PASS", gen=2):
+        v = self.j("verify", id)
+        d, renv = self.launch(c, "reviewer", gen=gen)
+        self.j("review-record", id, verdict, "--candidate-sha", "-", "--manifest-sha256", v["manifest_sha256"], env=renv)
+        return v["manifest_sha256"]
+
+    def db_rows(self, sql, *p):
+        import sqlite3
+        c = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        try:
+            return c.execute(sql, p).fetchall()
+        finally:
+            c.close()
+
+    def db_exec(self, sql, *p):
+        import sqlite3
+        c = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        c.execute(sql, p)
+        c.commit()
+        c.close()
+
+
+class TestCompleteVerifiedNoncode(NonCode):
+    def cv(self, *a, rc=0, **kw):
+        return self.j("complete-verified", "N-1", "--kind", "noncode", "--human", *a, rc=rc, **kw)
+
+    def test_reviewer_pass_completes_and_repeat_is_noop(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        r = self.cv()
+        self.assertTrue(r["completed"])
+        self.assertEqual(self.j("status", "N-1")["state"], "done")
+        n = len(self.events())
+        r2 = self.cv()
+        self.assertTrue(r2["noop"])
+        self.assertEqual(len(self.events()), n)  # no second effect
+        self.assertEqual([x[0] for x in self.db_rows("SELECT phase FROM completions")], ["intent", "complete"])
+
+    def test_plain_mark_done_refused_on_noncode_card(self):
+        self.noncode_ready()
+        rc, o, e = self.run_cli("mark", "N-1", "done", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("complete-verified", e)
+        self.assertEqual(self.j("status", "N-1")["state"], "in-progress")
+
+    def test_needs_some_verdict(self):
+        self.noncode_ready()
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("verdict", e)
+
+    def test_coordinator_verdict_only_without_reviewer_verdict(self):
+        c, wd = self.noncode_ready()
+        r = self.cv("--coordinator-verdict", "checked the report by hand")
+        self.assertTrue(r["completed"])
+        self.assertIn("coordinator", r["basis"])
+
+    def test_coordinator_verdict_refused_when_reviewer_verdict_exists(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1", "REWORK")
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human",
+                                "--coordinator-verdict", "looks fine to me")
+        self.assertEqual(rc, 1)
+        self.assertIn("reviewer verdict", e)
+        self.assertEqual(self.j("status", "N-1")["state"], "in-review")
+
+    def test_reviewer_rework_blocks_completion(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1", "REWORK")
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("PASS", e)
+
+    def test_review_of_older_manifest_does_not_count(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        open(os.path.join(wd, "more.txt"), "w").write("y")
+        man = {"item": "N-1", "claim": "c2", "known_gaps": [], "evidence": [
+            {"id": "a", "kind": "artifact", "path": "more.txt", "sha256": hashlib.sha256(b"y").hexdigest()}]}
+        self.set_noncode_handoff("N-1", man)
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("PASS", e)
+
+    def test_reviewer_in_same_session_as_worker_rejected(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        sid = self.db_rows("SELECT session_id FROM generations WHERE role='worker'")[0][0]
+        self.assertTrue(sid)
+        self.db_exec("UPDATE generations SET session_id=? WHERE role='reviewer'", sid)
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("same session", e)
+
+    def test_rehash_after_review_detects_tamper(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        open(os.path.join(wd, "out.txt"), "w").write("tampered")
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("sha256 mismatch", e)
+        self.assertEqual(self.db_rows("SELECT * FROM completions"), [])
+
+    def test_symlink_artifact_refused(self):
+        c, wd = self.noncode_ready()
+        os.symlink("out.txt", os.path.join(wd, "link.txt"))
+        man = {"item": "N-1", "claim": "c", "known_gaps": [], "evidence": [
+            {"id": "a", "kind": "artifact", "path": "link.txt", "sha256": hashlib.sha256(b"x").hexdigest()}]}
+        self.set_noncode_handoff("N-1", man)
+        self.assertTrue(self.j("verify", "N-1")["ok"])  # plain verify follows links inside the dir
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human",
+                                "--coordinator-verdict", "ok")
+        self.assertEqual(rc, 1)
+        self.assertIn("symlink", e)
+
+    def test_symlinked_directory_component_refused(self):
+        c, wd = self.noncode_ready()
+        os.makedirs(os.path.join(wd, "real"))
+        open(os.path.join(wd, "real", "r.txt"), "w").write("z")
+        os.symlink("real", os.path.join(wd, "dirlink"))
+        man = {"item": "N-1", "claim": "c", "known_gaps": [], "evidence": [
+            {"id": "a", "kind": "report", "path": "dirlink/r.txt", "sha256": hashlib.sha256(b"z").hexdigest()}]}
+        self.set_noncode_handoff("N-1", man)
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human",
+                                "--coordinator-verdict", "ok")
+        self.assertEqual(rc, 1)
+        self.assertIn("symlink", e)
+
+    def test_needs_artifact_or_report(self):
+        c, wd = self.noncode_ready(only=[{"id": "d", "kind": "doc", "url": "https://example.invalid/x"}])
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human",
+                                "--coordinator-verdict", "ok")
+        self.assertEqual(rc, 1)
+        self.assertIn("artifact or report", e)
+
+    def test_needs_coordinator_authority(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        renv = self.cap("N-1", "reviewer", 2)
+        self.assertEqual(self.run_cli("complete-verified", "N-1", "--kind", "noncode", env=renv)[0], 3)
+        self.assertEqual(self.run_cli("complete-verified", "N-1", "--kind", "noncode",
+                                      env=self.cap("N-1", "worker", 1))[0], 3)
+        self.assertEqual(self.run_cli("complete-verified", "N-1", "--kind", "noncode")[0], 3)
+
+    def test_dry_run_persists_nothing(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        r = self.cv("--dry-run")
+        self.assertTrue(r["dry_run"])
+        self.assertEqual(self.j("status", "N-1")["state"], "in-review")
+        self.assertEqual(self.db_rows("SELECT * FROM completions"), [])
+
+    def test_unknown_outcome_is_terminal_until_reconciled(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        self.db_exec("INSERT INTO completions VALUES('N-1','noncode','intent','2026-01-01T00:00:00Z','crash')")
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 5)
+        self.assertIn("reconcile", e)
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "noncode", "--human")
+        self.assertEqual(rc, 5)  # still terminal: no retry
+        self.assertEqual(self.j("complete-verified", "N-1", "--kind", "noncode", "--human", "--reconcile")["reconciled"],
+                         "not_completed")
+        self.assertTrue(self.cv()["completed"])  # now retry is allowed
+
+    def test_reconcile_recognises_a_finished_completion(self):
+        c, wd = self.noncode_ready()
+        self.review(c, "N-1")
+        self.db_exec("INSERT INTO completions VALUES('N-1','noncode','intent','2026-01-01T00:00:00Z','crash')")
+        self.db_exec("UPDATE items SET state='done' WHERE id='N-1'")
+        self.assertEqual(self.j("complete-verified", "N-1", "--kind", "noncode", "--human", "--reconcile")["reconciled"],
+                         "complete")
+        self.assertTrue(self.cv()["noop"])
+
+    def test_wrong_kind_for_card(self):
+        c, wd = self.noncode_ready()
+        rc, o, e = self.run_cli("complete-verified", "N-1", "--kind", "already-integrated", "--human",
+                                "--candidate-sha", "a" * 40)
+        self.assertEqual(rc, 1)
+        self.assertIn("code card", e)
+
+
+class TestCompleteVerifiedIntegrated(Base):
+    def integrate(self, sha, cherry=False):
+        with self.env({"GIT_COMMITTER_DATE": "2001-01-01T00:00:00Z"} if cherry else None):
+            sh(self.other, "fetch", "origin")
+            sh(self.other, "checkout", "-B", "main", "origin/main")
+            if cherry:
+                sh(self.other, "cherry-pick", sha)
+            else:
+                sh(self.other, "merge", "--ff-only", sha)
+            sh(self.other, "push", "origin", "main")
+
+    def cv(self, sha, *a, rc=0):
+        return self.j("complete-verified", "W-1", "--kind", "already-integrated", "--candidate-sha", sha,
+                      "--human", *a, rc=rc)
+
+    def test_ancestor_with_reviewer_pass_completes(self):
+        c, sha, mh = self.reviewed()
+        self.integrate(sha)
+        r = self.cv(sha)
+        self.assertTrue(r["completed"])
+        self.assertEqual(self.j("status", "W-1")["state"], "done")
+        self.assertTrue(self.cv(sha)["noop"])
+
+    def test_patch_equivalent_commit_completes(self):
+        c, sha, mh = self.reviewed()
+        self.integrate(sha, cherry=True)
+        self.assertNotEqual(self.git(self.origin, "rev-parse", "main"), sha)
+        self.assertTrue(self.cv(sha)["completed"])
+
+    def test_candidate_adding_changes_refused(self):
+        c, sha, mh = self.reviewed()
+        rc, o, e = self.run_cli("complete-verified", "W-1", "--kind", "already-integrated", "--candidate-sha", sha,
+                                "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("adds changes", e)
+        self.assertEqual(self.j("status", "W-1")["state"], "in-review")
+
+    def test_needs_reviewer_pass_bound_to_candidate_and_manifest(self):
+        c, sha, wenv = self.ready()
+        self.integrate(sha)
+        rc, o, e = self.run_cli("complete-verified", "W-1", "--kind", "already-integrated", "--candidate-sha", sha,
+                                "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("PASS", e)
+
+    def test_review_rework_refused(self):
+        c, sha, mh = self.reviewed(verdict="REWORK")
+        self.integrate(sha)
+        rc, o, e = self.run_cli("complete-verified", "W-1", "--kind", "already-integrated", "--candidate-sha", sha,
+                                "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("PASS", e)
+
+    def test_candidate_must_match_manifest_commit(self):
+        c, sha, mh = self.reviewed()
+        self.integrate(sha)
+        rc, o, e = self.run_cli("complete-verified", "W-1", "--kind", "already-integrated",
+                                "--candidate-sha", "c" * 40, "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("manifest", e)
+
+    def test_noncode_kind_refused_on_code_card(self):
+        c, sha, mh = self.reviewed()
+        rc, o, e = self.run_cli("complete-verified", "W-1", "--kind", "noncode", "--human", "--coordinator-verdict", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("non-code", e)
+
+    def test_land_refuses_an_already_integrated_candidate(self):
+        c, sha, mh = self.reviewed()
+        self.integrate(sha)
+        rc, o, e = self.run_cli("land", "W-1", "--sha", sha, "--human")
+        self.assertEqual(rc, 1)
+        self.assertIn("complete-verified", e)
+
+    def test_dry_run(self):
+        c, sha, mh = self.reviewed()
+        self.integrate(sha)
+        self.assertTrue(self.cv(sha, "--dry-run")["dry_run"])
+        self.assertEqual(self.j("status", "W-1")["state"], "in-review")
+
+
+class TestBranchRebind(Base):
+    def pf(self, env, action="commit"):
+        rc, o, e = self.run_cli("preflight", "--action", action, "--target", self.wt(), "--json", env=env)
+        return rc, json.loads(o)
+
+    def setUp(self):
+        super().setUp()
+        _, self.env1 = self.launch(self.card())
+
+    def test_worker_may_force_push_its_own_branch_after_squash(self):
+        wd = self.wt()
+        for i in range(2):
+            open(os.path.join(wd, "f%d" % i), "w").write("x")
+            self.git(wd, "add", "-A")
+            self.git(wd, "commit", "-m", "c%d" % i)
+        self.git(wd, "push", "origin", "fleet/w-1")
+        self.git(wd, "reset", "--soft", "origin/main")
+        self.git(wd, "commit", "-m", "squashed")
+        self.git(wd, "push", "--force-with-lease", "origin", "fleet/w-1")
+        self.assertEqual(self.git(self.origin, "rev-parse", "fleet/w-1"), self.git(wd, "rev-parse", "HEAD"))
+        self.assertEqual(self.pf(self.env1)[0], 0)
+
+    def test_rework_rename_is_rebound_with_audit_event(self):
+        self.git(self.wt(), "branch", "-m", "fleet/w-1-r2")
+        rc, d = self.pf(self.env1)
+        self.assertEqual((rc, d["allowed"]), (0, True), d)
+        st = self.j("status", "W-1")
+        self.assertEqual(st["branch"], "fleet/w-1-r2")
+        ev = [e for e in self.j("events") if e["kind"] == "branch:rebound"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["detail"]["from"], ev[0]["detail"]["to"]), ("fleet/w-1", "fleet/w-1-r2"))
+        rc, d = self.pf(self.env1, "build")  # idempotent: no second event
+        self.assertEqual(rc, 0)
+        self.assertEqual(len([e for e in self.j("events") if e["kind"] == "branch:rebound"]), 1)
+
+    def test_relaunch_after_rebind_reuses_the_renamed_worktree(self):
+        c = self.card()
+        self.wait_dead("W-1")
+        self.git(self.wt(), "branch", "-m", "fleet/w-1-r2")
+        self.assertEqual(self.pf(self.env1)[0], 0)
+        d = self.j("launch", c, "--human")
+        self.assertEqual(d["workdir"], self.wt())
+        self.assertEqual(d["branch"], "fleet/w-1-r2")
+
+    def test_second_rework_rename_also_rebinds(self):
+        self.git(self.wt(), "branch", "-m", "fleet/w-1-r2")
+        self.assertEqual(self.pf(self.env1)[0], 0)
+        self.git(self.wt(), "branch", "-m", "fleet/w-1-r3")
+        self.assertEqual(self.pf(self.env1)[0], 0)
+        self.assertEqual(self.j("status", "W-1")["branch"], "fleet/w-1-r3")
+
+    def test_other_branches_stay_denied(self):
+        for name in ("fleet/w-1-rx", "fleet/other-r2", "main", "fleet/w-1-r2/x", "fleet/w-1-r"):
+            with self.subTest(branch=name):
+                self.git(self.wt(), "checkout", "-B", name)
+                rc, d = self.pf(self.env1)
+                self.assertEqual(rc, 3, d)
+                self.assertEqual(self.j("status", "W-1")["branch"], "fleet/w-1")
+        self.assertEqual([e for e in self.j("events") if e["kind"] == "branch:rebound"], [])
+
+    def test_edit_never_rebinds(self):
+        self.git(self.wt(), "branch", "-m", "fleet/w-1-r2")
+        self.assertEqual(self.pf(self.env1, "edit")[0], 0)
+        self.assertEqual(self.j("status", "W-1")["branch"], "fleet/w-1")
+
+
+class TestRelaunchRelay(Base):
+    def log_of(self, item="W-1"):
+        return self.j("status", item)["generations"]["worker"]["log_path"]
+
+    def write_log(self, lines):
+        with open(self.log_of(), "a") as f:
+            for ln in lines:
+                f.write((ln if isinstance(ln, str) else json.dumps(ln)) + "\n")
+
+    def prompt(self, gen):
+        with open(os.path.join(self.out, "W-1_worker_%d.prompt" % gen)) as f:
+            return f.read()
+
+    def test_relaunch_appends_redacted_bounded_tail_and_diffstat(self):
+        c = self.card()
+        self.launch(c)
+        wd = self.wt()
+        with open(os.path.join(wd, "new.txt"), "w") as f:
+            f.write("hello\n")
+        self.git(wd, "add", "-A")
+        self.git(wd, "commit", "-m", "wip")
+        secret = "sk-" + "A1b2C3d4" * 6
+        self.write_log([
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "plan: edit parser. Authorization: Bearer " + secret},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "curl 'https://x.invalid/?access_token=abc123def456ghi'"}}]}},  # skills-repo: allow-test-secret
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "password=hunter2hunter2 done"}},  # skills-repo: allow-test-secret
+            "plain stdout line with API_KEY=zzzzzzzzzzzz",
+        ])
+        self.j("launch", c, "--human")
+        p = self.prompt(2)
+        self.assertIn("HANDOFF", p)
+        self.assertIn("plan: edit parser", p)
+        self.assertIn("Bash", p)
+        self.assertIn("new.txt", p)  # diff stat vs base
+        for leaked in (secret, "abc123def456ghi", "hunter2hunter2", "zzzzzzzzzzzz"):
+            self.assertNotIn(leaked, p)
+        self.assertIn("[REDACTED]", p)
+
+    def test_relay_is_bounded_and_keeps_the_tail(self):
+        c = self.card()
+        self.launch(c)
+        self.write_log([{"type": "item.completed", "item": {"type": "agent_message", "text": "line-%05d " % i + "x" * 200}}
+                        for i in range(400)])
+        self.j("launch", c, "--human")
+        p = self.prompt(2)
+        start = p.index("Context relay")
+        self.assertLessEqual(len(p) - start, 12000)
+        self.assertIn("line-00399", p)
+        self.assertNotIn("line-00000", p)
+
+    def test_missing_log_gives_empty_relay(self):
+        c = self.card()
+        self.launch(c)
+        os.remove(self.log_of())
+        self.j("launch", c, "--human")
+        p = self.prompt(2)
+        self.assertNotIn("Context relay", p)
+        self.assertIn("HANDOFF", p)
+
+    def test_escalate_relays_too(self):
+        c = self.card()
+        self.launch(c)
+        self.write_log(["tail marker QQQ"])
+        d = self.j("escalate", "W-1", "--human")
+        self.assertIn("tail marker QQQ", self.prompt(d["gen"]))
+        self.assertIn("continue from the evolved HANDOFF", self.prompt(d["gen"]))
+
+    def test_first_launch_has_no_relay(self):
+        self.launch(self.card())
+        self.assertNotIn("Context relay", self.prompt(1))
+
+
+class TestApprovedTiers(Base):
+    TIERS_CFG = {"A": {"model": "m-a", "effort": "medium", "reviewer": "A-review"},
+                 "A-review": {"model": "m-a", "effort": "high"},
+                 "C": {"model": "m-c", "effort": "xhigh", "reviewer": "C-review"},
+                 "C-review": {"model": "m-c", "effort": "max"}}
+
+    def use(self, tiers=None):
+        self.cfg["model_tiers"] = self.TIERS_CFG if tiers is None else tiers
+        self.write_cfg()
+
+    def fails(self, *argv):
+        rc, o, e = self.run_cli(*argv)
+        self.assertEqual(rc, 1, o)
+        self.assertNotIn("Traceback", e)
+        return e
+
+    def test_card_tier_selects_the_tuple(self):
+        self.use()
+        d = self.j("route", self.card(tier="A", scope="large", ambiguity="high", risk="high"))
+        self.assertEqual((d["worker"]["model"], d["worker"]["effort"], d["tier"]), ("m-a", "medium", "A"))
+        self.assertEqual((d["reviewer"]["model"], d["reviewer"]["effort"]), ("m-a", "high"))
+
+    def test_launch_uses_the_approved_tuple(self):
+        self.use()
+        d, env = self.launch(self.card(tier="C"))
+        st = self.j("status", "W-1")["generations"]["worker"]
+        self.assertEqual((st["model"], st["effort"], st["tier"]), ("m-c", "xhigh", "C"))
+
+    def test_explicit_reviewer_tier_wins(self):
+        self.use()
+        d = self.j("route", self.card(tier="A", reviewer_tier="C-review"))
+        self.assertEqual((d["reviewer"]["model"], d["reviewer"]["effort"]), ("m-c", "max"))
+
+    def test_unknown_tier_fails_closed(self):
+        self.use()
+        self.assertIn("tier", self.fails("route", self.card(tier="Z")))
+        self.assertIn("tier", self.fails("launch", self.card("W-2", tier="Z"), "--human"))
+
+    def test_tier_without_configured_set_fails_closed(self):
+        self.assertIn("model_tiers", self.fails("route", self.card(tier="A")))
+        self.use({})
+        self.assertIn("model_tiers", self.fails("route", self.card(tier="A")))
+
+    def test_empty_card_tier_is_a_lint_error(self):
+        self.use()
+        rc, o, e = self.run_cli("card-lint", self.card(tier=""))
+        self.assertEqual(rc, 1)
+        self.assertIn("tier is empty", o)
+
+    def test_tier_and_effort_override_conflict(self):
+        self.use()
+        self.assertIn("tier", self.fails("route", self.card(tier="A", effort="high", effort_reason="x")))
+
+    def test_partial_entry_fails_closed(self):
+        self.use({"A": {"model": "m-a"}})
+        self.assertIn("effort", self.fails("route", self.card(tier="A")))
+        self.use({"A": {"effort": "low"}})
+        self.assertIn("model", self.fails("route", self.card(tier="A")))
+        self.use({"A": {"model": "", "effort": "low"}})
+        self.assertIn("model", self.fails("route", self.card(tier="A")))
+
+    def test_duplicate_tuple_fails_closed(self):
+        self.use({"A": {"model": "m", "effort": "high"}, "B": {"model": "m", "effort": "high"}})
+        self.assertIn("duplicate", self.fails("route", self.card(tier="A")))
+
+    def test_duplicate_json_key_fails_closed(self):
+        self.use()
+        p = os.path.join(self.home, "fleet.json")
+        with open(p) as f:
+            txt = f.read()
+        with open(p, "w") as f:
+            f.write(txt.replace('"model_tiers": {', '"model_tiers": {"A": {"model": "x", "effort": "low"}, ', 1))
+        self.assertIn("duplicate", self.fails("route", self.card(tier="A")))
+
+    def test_dangling_reviewer_link_fails_closed(self):
+        self.use({"A": {"model": "m-a", "effort": "low", "reviewer": "nope"}})
+        self.assertIn("reviewer", self.fails("route", self.card(tier="A")))
+
+    def test_relaunch_keeps_the_registry_tuple_exactly(self):
+        self.use()
+        c = self.card(tier="A")
+        self.launch(c)
+        self.cfg["model_tiers"]["A"] = {"model": "m-new", "effort": "low", "reviewer": "A-review"}
+        self.write_cfg()
+        d = self.j("launch", c, "--human")
+        self.assertEqual((d["model"], d["effort"], d["tier"]), ("m-a", "medium", "A"))
+
+    def test_explicit_tier_on_relaunch_changes_the_tuple(self):
+        self.use()
+        c = self.card(tier="A")
+        self.launch(c)
+        d = self.j("launch", c, "--human", "--tier", "C")
+        self.assertEqual((d["model"], d["effort"], d["tier"]), ("m-c", "xhigh", "C"))
+        rc, o, e = self.run_cli("launch", c, "--human", "--tier", "Z")
+        self.assertEqual(rc, 1)
+
+    def test_relaunch_of_complexity_routed_card_keeps_tuple_too(self):
+        c = self.card()
+        self.launch(c)
+        self.cfg["runtimes"]["fake"]["tiers"]["low"] = {"effort": "high", "model": "m-changed"}
+        self.write_cfg()
+        d = self.j("launch", c, "--human")
+        self.assertEqual((d["model"], d["effort"]), ("m-fast", "low"))
+
+    def test_escalate_refuses_approved_tier_generation(self):
+        self.use()
+        self.launch(self.card(tier="A"))
+        self.assertIn("approved", self.fails("escalate", "W-1", "--human"))
+
+    def test_coordinator_change_needs_idle_and_fresh_generation_from_handoff(self):
+        self.hold()
+        cc = self.card("C-1", repo="-", base=None)
+        self.cfg["coordinator"] = {"effort": "high"}
+        self.write_cfg()
+        self.launch(cc, "coordinator", wait=False)
+        self.cfg["coordinator"] = {"effort": "xhigh"}
+        self.write_cfg()
+        self.assertIn("idle", self.fails("launch", cc, "--role", "coordinator", "--human"))
+        self.release()
+        self.wait_dead("C-1", "coordinator")
+        d = self.j("launch", cc, "--role", "coordinator", "--human")
+        self.assertEqual((d["gen"], d["effort"]), (2, "xhigh"))
+        self.assertTrue([e for e in self.j("events") if e["kind"] == "coordinator:tuple_changed"])
+        # a changed tuple needs the HANDOFF the fresh generation resumes from
+        self.wait_dead("C-1", "coordinator")
+        os.remove(os.path.join(self.home, "work", "c-1", "HANDOFF.md"))
+        self.cfg["coordinator"] = {"effort": "medium"}
+        self.write_cfg()
+        self.assertIn("HANDOFF", self.fails("launch", cc, "--role", "coordinator", "--human"))
+
+
+class TestDocContracts(unittest.TestCase):
+    """The card template carries the worker rules that the prose docs refer to."""
+
+    def test_template_carries_worker_rules(self):
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(root, "assets", "dispatch-card.template.md")) as f:
+            tpl = f.read()
+        for phrase in ("Not blockers", "wait 1-2 minutes", "at most 5 times", "known_gaps", "--force-with-lease",
+                       "45 minutes", "next_action:", "Pre-push self-check", "review rounds of your own"):
+            self.assertIn(phrase, tpl)
+        prohibited = tpl[tpl.index("**Prohibited:**"):tpl.index("**Escalation:**")]
+        self.assertIn("force-push of anything but this", prohibited)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
