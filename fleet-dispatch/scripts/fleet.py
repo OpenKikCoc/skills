@@ -19,6 +19,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import time
 import types
@@ -1089,6 +1090,45 @@ def cmd_review_record(args):
     return 0
 
 
+def _patch_id(repo, a, b):
+    d = run_git(repo, "diff", "--binary", a, b)
+    p = subprocess.run(["git", "-C", repo, "patch-id", "--stable"], input=d.stdout, capture_output=True, text=True)
+    return p.stdout.split()[0] if p.stdout.strip() else ""
+
+
+def replay_equivalent(repo, base, sha, guards):
+    """Replay the reviewed commits onto origin/<base> when the base drift cannot affect them.
+    Safe only when (1) no drift file is a candidate file, (2) no drift file is under a guard prefix,
+    (3) the candidate range has no merges, and (4) the replayed patch-id equals the reviewed one.
+    Returns (new_sha, detail) or (None, reason)."""
+    ob = "origin/" + base
+    mb = git(repo, "merge-base", ob, sha)
+    if git(repo, "rev-list", "--merges", mb + ".." + sha):
+        return None, "candidate range contains merges"
+    cand = set(git(repo, "diff", "--name-only", mb, sha).splitlines())
+    drift = set(git(repo, "diff", "--name-only", mb, ob).splitlines())
+    if cand & drift:
+        return None, "base drift touches candidate files: " + ", ".join(sorted(cand & drift)[:5])
+    hit = sorted(f for f in drift if any(f.startswith(g) for g in guards))
+    if hit:
+        return None, "base drift touches guarded paths: " + ", ".join(hit[:5])
+    tmp = tempfile.mkdtemp(prefix="fleet-land-")
+    try:
+        git(repo, "worktree", "add", "--detach", tmp, ob)
+        r = run_git(tmp, "cherry-pick", "--allow-empty", mb + ".." + sha)
+        if r.returncode != 0:
+            run_git(tmp, "cherry-pick", "--abort")
+            return None, "replay failed: " + (r.stderr or r.stdout).strip()[-200:]
+        new = git(tmp, "rev-parse", "HEAD")
+    finally:
+        run_git(repo, "worktree", "remove", "--force", tmp)
+        shutil.rmtree(tmp, True)
+    if _patch_id(repo, mb, sha) != _patch_id(repo, ob, new):
+        return None, "patch-id changed after replay"
+    return new, "replayed %s onto %s (drift %d files, disjoint from candidate and guards)" % (
+        sha[:12], git(repo, "rev-parse", ob)[:12], len(drift))
+
+
 def land_record(item, sha, phase, detail=""):
     x("INSERT INTO lands VALUES(?,?,?,?,?)", item, sha, phase, now(), detail)
 
@@ -1149,23 +1189,41 @@ def cmd_land(args):
         refuse("fetch failed: " + g.stderr.strip())
     if adds_nothing(it["repo"], it["base"], sha):
         refuse("the candidate adds nothing to origin/%s: close it with complete-verified --kind already-integrated" % it["base"])
-    if run_git(it["repo"], "merge-base", "--is-ancestor", "origin/" + it["base"], sha).returncode != 0:
-        refuse("not a fast-forward: origin/%s moved; rework to rebase, then re-verify and re-review" % it["base"])
-    land_record(args.item, sha, "pushing")
-    try:
-        r = git_push(it["repo"], sha, it["base"], S.cfg["limits"]["push_timeout_s"])
-    except Exception as e:  # timeout or anything unexpected: the effect is unknown
-        land_record(args.item, sha, "result_unknown", repr(e))
-        emit(args.item, "result_unknown", urgent=True, sha=sha, error=repr(e))
-        print("error: push result unknown (%s); never retry blindly: run land --reconcile" % type(e).__name__, file=sys.stderr)
-        return 5
-    if r.returncode != 0:
-        land_record(args.item, sha, "failed", r.stderr.strip())
-        emit(args.item, "land:failed", urgent=True, sha=sha, stderr=r.stderr.strip()[-300:])
-        raise Fail("push rejected: " + r.stderr.strip())
-    finish_landed(args.item, sha, "push")
-    out(args, {"landed": True, "sha": sha}, "landed %s on %s" % (sha[:12], it["base"]))
-    return 0
+    reviewed, via = sha, "push"
+    for attempt in range(3):
+        push_sha = reviewed
+        if run_git(it["repo"], "merge-base", "--is-ancestor", "origin/" + it["base"], reviewed).returncode != 0:
+            if not args.rebase_equivalent:
+                refuse("not a fast-forward: origin/%s moved; rework to rebase, then re-verify and re-review "
+                       "(or land --rebase-equivalent when the drift is disjoint)" % it["base"])
+            push_sha, why = replay_equivalent(it["repo"], it["base"], reviewed, args.guard or [])
+            if not push_sha:
+                refuse("not a fast-forward and not rebase-equivalent: " + why)
+            land_record(args.item, push_sha, "rebased", "reviewed %s; %s" % (reviewed, why))
+            emit(args.item, "land:rebased", reviewed=reviewed, sha=push_sha, detail=why)
+            via = "push-rebased"
+        land_record(args.item, push_sha, "pushing")
+        try:
+            r = git_push(it["repo"], push_sha, it["base"], S.cfg["limits"]["push_timeout_s"])
+        except Exception as e:  # timeout or anything unexpected: the effect is unknown
+            land_record(args.item, push_sha, "result_unknown", repr(e))
+            emit(args.item, "result_unknown", urgent=True, sha=push_sha, error=repr(e))
+            print("error: push result unknown (%s); never retry blindly: run land --reconcile" % type(e).__name__, file=sys.stderr)
+            return 5
+        if r.returncode == 0:
+            finish_landed(args.item, push_sha, via)
+            out(args, {"landed": True, "sha": push_sha, "reviewed_sha": reviewed},
+                "landed %s on %s" % (push_sha[:12], it["base"]))
+            return 0
+        racing = args.rebase_equivalent and re.search(r"non-fast-forward|fetch first|rejected", r.stderr)
+        if not racing or attempt == 2:
+            land_record(args.item, push_sha, "failed", r.stderr.strip())
+            emit(args.item, "land:failed", urgent=True, sha=push_sha, stderr=r.stderr.strip()[-300:])
+            raise Fail("push rejected: " + r.stderr.strip())
+        land_record(args.item, push_sha, "raced", r.stderr.strip()[-200:])  # base moved between fetch and push
+        if run_git(it["repo"], "fetch", "origin", timeout=120).returncode != 0:
+            refuse("fetch failed after a raced push")
+    raise Fail("unreachable")
 
 
 # ---------------------------------------------------------------- state / status
@@ -1850,7 +1908,11 @@ def build_parser():
         A("verdict", type=str.upper, choices=["PASS", "REWORK"]), A("--candidate-sha", required=True),
         A("--manifest-sha256", required=True), A("--notes-file"))
     cmd("land", cmd_land, "ff-only push of the reviewed SHA", A("item"), A("--sha", required=True),
-        A("--reconcile", action="store_true"))
+        A("--reconcile", action="store_true"),
+        A("--rebase-equivalent", action="store_true",
+          help="if the base moved, replay the reviewed commits onto it when the drift is disjoint from the "
+               "candidate files and every --guard prefix and the patch-id is unchanged"),
+        A("--guard", action="append", help="path prefix the base drift must not touch (repeatable)"))
     cmd("complete-verified", cmd_complete_verified, "close a finished non-code card or an already-integrated candidate",
         A("item"), A("--kind", required=True, choices=["noncode", "already-integrated"]), A("--candidate-sha"),
         A("--coordinator-verdict"), A("--dry-run", action="store_true"), A("--reconcile", action="store_true"))

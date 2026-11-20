@@ -828,6 +828,51 @@ class TestReviewAndLand(Base):
         self.assertIn("fast-forward", e)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), moved)
 
+    def _move_base(self, path, text="m"):
+        full = os.path.join(self.other, path)
+        os.makedirs(os.path.dirname(full) or self.other, exist_ok=True)
+        self.git(self.other, "pull", "-q", "origin", "main")
+        with open(full, "w") as f:
+            f.write(text)
+        self.git(self.other, "add", "-A")
+        self.git(self.other, "commit", "-m", "base moved: " + path)
+        self.git(self.other, "push", "origin", "main")
+        return self.git(self.origin, "rev-parse", "main")
+
+    def _cand_files(self, sha):
+        return set(self.git(self.origin, "diff", "--name-only", sha + "^", sha).split())
+
+    def test_land_rebase_equivalent_replays_onto_disjoint_drift(self):
+        c, sha, mh = self.reviewed()
+        moved = self._move_base("unrelated/doc.txt")
+        rc, o, e = self.run_cli("land", "W-1", "--sha", sha, "--human", "--rebase-equivalent",
+                                "--guard", "guarded/")
+        self.assertEqual(rc, 0, e)
+        head = self.git(self.origin, "rev-parse", "main")
+        self.assertNotEqual(head, sha)
+        self.assertEqual(self.git(self.origin, "rev-parse", head + "^"), moved)  # replayed on top of drift
+        self.assertEqual(self._cand_files(head), self._cand_files(sha))
+        self.assertEqual(self.j("status", "W-1")["state"], "landed")
+        self.assertIn("land:rebased", self.kinds("W-1"))
+
+    def test_land_rebase_equivalent_refuses_guarded_drift(self):
+        c, sha, mh = self.reviewed()
+        moved = self._move_base("guarded/rule.json")
+        rc, o, e = self.run_cli("land", "W-1", "--sha", sha, "--human", "--rebase-equivalent",
+                                "--guard", "guarded/")
+        self.assertEqual(rc, 1)
+        self.assertIn("guarded", e)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), moved)
+
+    def test_land_rebase_equivalent_refuses_overlapping_drift(self):
+        c, sha, mh = self.reviewed()
+        f = sorted(self._cand_files(sha))[0]
+        moved = self._move_base(f, "conflicting\n")
+        rc, o, e = self.run_cli("land", "W-1", "--sha", sha, "--human", "--rebase-equivalent")
+        self.assertEqual(rc, 1)
+        self.assertIn("candidate files", e)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), moved)
+
     def test_land_unknown_result_and_reconcile(self):
         c, sha, mh = self.reviewed()
         real = fleet.git_push
