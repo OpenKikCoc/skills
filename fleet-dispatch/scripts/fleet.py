@@ -829,8 +829,10 @@ def launch_core(card, role, dry, tier=None, replace=False, reason="", runtime=No
         if info["code"] and it["branch"]:
             info["branch"] = it["branch"]  # the registry owns the branch (a rework rename is rebound there)
         prev = current_gen(it["id"], role)
-        if prev and role in ("worker", "reviewer") and not tier and prev["model"] is not None:
-            # a relaunch without an explicit tier keeps the registered tuple exactly
+        if prev and role in ("worker", "reviewer") and not tier and prev["model"] is not None \
+                and prev["runtime"] == rtname:
+            # a relaunch without an explicit tier keeps the registered tuple exactly (same runtime only:
+            # another adapter's model name means nothing here, so it routes fresh)
             res = {"tier": prev["tier"], "effective_tier": prev["tier"], "clamped": False, "clamp_direction": None,
                    "model": prev["model"], "effort": prev["effort"]}
         if prev and role == "coordinator" and (prev["runtime"], prev["model"], prev["effort"]) != (

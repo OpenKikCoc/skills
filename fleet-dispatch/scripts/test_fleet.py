@@ -399,6 +399,14 @@ class TestLaunch(Base):
         self.assertEqual(rc, 1)
         self.assertIn("unknown runtime", e)
 
+    def test_launch_runtime_override_does_not_reuse_other_adapters_model(self):
+        c = self.card()  # runtime: fake (no model in argv); a prior generation exists
+        d = self.j("launch", c, "--role", "worker", "--human", "--tier", "medium")  # prior gen: model m-main
+        self.wait_dead("W-1", "worker")
+        e = self.j("launch", c, "--role", "worker", "--human", "--dry-run", "--runtime", "assign")
+        self.assertNotIn("m-main", e["argv"])
+        self.assertIn("m-fast", e["argv"])  # routed fresh on the assign adapter, not the fake gen's tuple
+
     def test_real_launch(self):
         c = self.card()
         d, env = self.launch(c)
