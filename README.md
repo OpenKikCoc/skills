@@ -11,6 +11,7 @@ category is the name prefix:
 | `meta-` | improving the agent and its skills from experience |
 | `ops-` | production operations and incident work |
 | `web-` | HTML deliverables |
+| `media-` | audio and media production |
 | `hr-` | hiring |
 
 Each directory is self-contained: `SKILL.md` is the entry point, `references/`
@@ -60,6 +61,12 @@ holds depth, `scripts/` holds standard-library tools with their own `test_*.py`.
 | [web-ai-companion](web-ai-companion/SKILL.md) | Embed a local-AI Q&A panel in any HTML page |
 | [web-diagram](web-diagram/SKILL.md) | Architecture, flow, and sequence diagrams as HTML cards with auto-routed SVG connectors; verifier checks overlaps and edge crossings, then renders headless |
 | [web-html-box](web-html-box/SKILL.md) | Self-contained interactive HTML block at a fixed viewport for docs and pages; exact-viewport overflow check and hash-verified publish |
+
+## media — audio and media production
+
+| Skill | What it does |
+|---|---|
+| [media-audiobook](media-audiobook/SKILL.md) | Novel → multi-voice audiobook + read-along player: two-model speaker attribution, context-derived delivery, voice design gated on cloned output (age/gender/distinctness, calibrated thresholds), human approval, mobile Safari player rules |
 
 ## hr — hiring
 
