@@ -796,15 +796,17 @@ def launch_prompt(role, item, handoff, wd, extra=""):
     return base + extra
 
 
-def launch_core(card, role, dry, tier=None, replace=False, reason=""):
+def launch_core(card, role, dry, tier=None, replace=False, reason="", runtime=None):
     text, fm, errs = load_card_file(card)
     if errs:
         raise Fail("card failed lint:\n  " + "\n  ".join(errs))
     info = card_info(fm)
-    rtname = fm["runtime"]
+    rtname = runtime or fm["runtime"]  # --runtime overrides per generation (quota, reviewer independence)
     rt = S.cfg["runtimes"].get(rtname)
     if not rt:
         raise Fail("unknown runtime %r" % rtname)
+    if runtime:
+        fm = dict(fm, runtime=rtname)
     routed = route_card(fm)
     if tier and role == "coordinator":
         raise Fail("--tier does not apply to the coordinator; its effort comes from config")
@@ -919,7 +921,7 @@ def launch_core(card, role, dry, tier=None, replace=False, reason=""):
 def cmd_launch(args):
     if not args.dry_run:
         actor(args, {"human"} if args.role == "coordinator" else {"coordinator", "human"})
-    plan = launch_core(args.card, args.role, args.dry_run, tier=args.tier)
+    plan = launch_core(args.card, args.role, args.dry_run, tier=args.tier, runtime=args.runtime)
     out(args, dict(plan, dry_run=args.dry_run),
         "%s %s g%s tier=%s effort=%s\n  workdir: %s\n  argv: %s" % (
             "would launch" if args.dry_run else "launched", plan["role"], plan["gen"], plan["tier"],
@@ -1893,7 +1895,8 @@ def build_parser():
     cmd("route", cmd_route, "compute tier/model/effort for a card", A("card"))
     cmd("launch", cmd_launch, "start a worker/reviewer/coordinator generation", A("card"),
         A("--role", choices=["worker", "reviewer", "coordinator"], default="worker"),
-        A("--dry-run", action="store_true"), A("--tier", help="explicit tier: an approved model_tiers name or an effort tier"))
+        A("--dry-run", action="store_true"), A("--tier", help="explicit tier: an approved model_tiers name or an effort tier"),
+        A("--runtime", help="runtime adapter for this generation instead of the card's (e.g. quota exhausted, reviewer on another model family)"))
     cmd("status", cmd_status, "show items, HANDOFF state and sessions", A("item", nargs="?"))
     cmd("mark", cmd_mark, "set item state (capability-gated)", A("item"), A("state"))
     cmd("preflight", cmd_preflight, "gate a worker mutation", A("--action", choices=["edit", "commit", "build"], required=True),

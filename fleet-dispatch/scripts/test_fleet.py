@@ -391,6 +391,14 @@ class TestLaunch(Base):
         rc, o, e = self.run_cli("launch", self.card())
         self.assertEqual(rc, 3)
 
+    def test_launch_runtime_override_per_generation(self):
+        c = self.card()  # card says runtime: fake
+        d = self.j("launch", c, "--role", "worker", "--human", "--dry-run", "--runtime", "assign")
+        self.assertIn("<session-id>", d["argv"])  # assign adapter (session_id_mode=assign); fake captures instead
+        rc, o, e = self.run_cli("launch", c, "--human", "--dry-run", "--runtime", "nope")
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown runtime", e)
+
     def test_real_launch(self):
         c = self.card()
         d, env = self.launch(c)
