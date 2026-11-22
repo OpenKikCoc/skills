@@ -559,6 +559,20 @@ class TestPreflight(Base):
         rc, d = self.pf(self.env1, os.path.join(self.wt(), "link", "x.txt"))
         self.assertEqual(rc, 3)
 
+    def test_declared_sandbox_hostname_counts_as_host(self):
+        # 11-22 ND-12: agy Claude workers run in a local sandbox named "sandbox" -> host mismatch.
+        import socket
+        c = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        c.execute("UPDATE generations SET host='elsewhere'")
+        c.commit()
+        c.close()
+        self.assertEqual(self.pf(self.env1, self.wt())[0], 3)
+        self.cfg["runtimes"]["fake"]["sandbox_hostnames"] = [socket.gethostname()]
+        self.write_cfg()
+        rc, d = self.pf(self.env1, self.wt())
+        self.assertEqual(rc, 0, d)
+        self.assertEqual(self.pf(self.env1, self.tmp)[0], 3)  # worktree binding still enforced
+
     def test_wrong_branch_denies_commit_and_build_only(self):
         self.git(self.wt(), "checkout", "-b", "somewhere-else")
         self.assertEqual(self.pf(self.env1, self.wt(), "commit")[0], 3)

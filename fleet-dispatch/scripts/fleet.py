@@ -1519,7 +1519,10 @@ def cmd_preflight(args):
         if e.get("FLEET_ROLE") == "worker" else (None, "role is not worker")
     if not g:
         reason = why
-    elif g["host"] != socket.gethostname():
+    elif g["host"] != socket.gethostname() and socket.gethostname() not in \
+            ((S.cfg.get("runtimes") or {}).get(g["runtime"]) or {}).get("sandbox_hostnames", []):
+        # 11-22 ND-12: agy's Claude models run in a local sandbox whose hostname is "sandbox";
+        # the capability already binds this gen, so a declared sandbox name counts as its host.
         reason = "host mismatch"
     else:
         root, tgt = os.path.realpath(g["worktree"]), os.path.realpath(args.target)
