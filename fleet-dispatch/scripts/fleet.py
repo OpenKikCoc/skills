@@ -1455,6 +1455,9 @@ def cmd_rework(args):
     append_progress(hp, "REWORK:\n" + req)
     x("UPDATE items SET state='in-progress', updated=? WHERE id=?", now(), args.item)
     emit(args.item, "rework", chars=len(req))
+    # reset the watched state so the worker's next awaiting-verify counts as a change and wakes the
+    # coordinator (otherwise the last state event is already state:awaiting-verify and nothing fires)
+    emit(args.item, "state:in-progress", state="in-progress", doing="rework")
     res = {"item": args.item, "resumed": False}
     try:
         res.update(resumed=True, gen=resume_gen(worker_gen_for_resume(args.item), "Rework requested: see the REWORK block in Progress.")["gen"])
