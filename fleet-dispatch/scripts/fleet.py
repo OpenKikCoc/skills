@@ -659,6 +659,9 @@ def resume_gen(g, message=None, use_steers=True):
     for s in steers:
         x("UPDATE steers SET delivered=1 WHERE rowid=?", s["r"])
     emit(g["item"], "resumed", role=g["role"], gen=r["gen"], from_gen=g["gen"], steers=len(steers))
+    if g["role"] == "worker":
+        # a resumed worker that re-delivers the same HANDOFF state must still wake the coordinator
+        emit(g["item"], "state:in-progress", state="in-progress", doing="resumed")
     return r
 
 

@@ -1059,6 +1059,17 @@ class TestWatch(Base):
     def watch(self, *extra):
         return self.j("watch", "--once", *extra)
 
+    def test_awaiting_verify_after_resume_emits_again(self):
+        # 11-22 ND-11: a steer-resumed worker re-delivered awaiting-verify; no event, coordinator never woken.
+        c, sha, wenv = self.ready()
+        self.watch()
+        self.assertEqual(self.j("resume", "W-1", "one more check", "--human")["gen"] > 1, True)
+        self.wait_dead("W-1", "worker")
+        self.set_handoff("W-1", json.loads(re.search(r"```json\n(.*?)```", open(
+            os.path.join(self.wt(), "HANDOFF.md")).read(), re.S).group(1)))
+        self.watch()
+        self.assertEqual(self.kinds("W-1").count("state:awaiting-verify"), 2)
+
     def test_awaiting_verify_after_rework_emits_again(self):
         # 11-22 ND-10: a rework whose worker re-delivered awaiting-verify produced no event, so the
         # coordinator was never woken (the last state event was already state:awaiting-verify).
