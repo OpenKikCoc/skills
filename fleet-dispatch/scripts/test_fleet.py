@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1084,6 +1085,30 @@ class TestWatch(Base):
             os.path.join(self.wt(), "HANDOFF.md")).read(), re.S).group(1)))
         self.watch()
         self.assertEqual(self.kinds("W-1").count("state:awaiting-verify"), 2)
+
+    def test_awaiting_verify_while_alive_wakes_on_exit(self):
+        # 11-22 ND-11: worker wrote awaiting-verify mid-edit, coordinator deferred, exit woke nobody.
+        c, sha, wenv = self.ready()
+        p = subprocess.Popen(["sleep", "60"])
+        db = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        db.execute("UPDATE generations SET pid=? WHERE item='W-1' AND role='worker'", (p.pid,))
+        db.commit()
+        db.close()
+        self.watch()
+        self.assertIn("state:awaiting-verify", self.kinds("W-1"))
+        self.assertNotIn("session:finished", self.kinds("W-1"))
+        p.kill()
+        p.wait()
+        self.watch()
+        self.assertEqual(self.kinds("W-1").count("session:finished"), 1)
+        self.watch()
+        self.assertEqual(self.kinds("W-1").count("session:finished"), 1)
+
+    def test_awaiting_verify_after_exit_no_finished_event(self):
+        c, sha, wenv = self.ready()
+        self.watch()
+        self.watch()
+        self.assertNotIn("session:finished", self.kinds("W-1"))
 
     def test_state_change_exit_and_idempotency(self):
         self.launch(self.card())

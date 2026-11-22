@@ -1667,6 +1667,15 @@ def watch_items(new):
             continue
         if not wg["fenced"] and wg["pid"] and not alive(wg["pid"]) and cur != "awaiting-verify":
             ev(it["id"], "session:exited", key="exited:%s:%d" % (it["id"], wg["gen"]), gen=wg["gen"])
+        # 11-22 ND-11: the worker wrote awaiting-verify while still editing; the coordinator found
+        # verify failing, waited, and nothing woke it when the worker exited. Remember that the
+        # delivery was seen live, and wake again once the process is gone.
+        if cur == "awaiting-verify" and not wg["fenced"] and wg["pid"]:
+            live_key = "avf-live:%s:%d" % (it["id"], wg["gen"])
+            if alive(wg["pid"]):
+                once(live_key)
+            elif q1("SELECT 1 FROM wakes WHERE key=?", live_key):
+                ev(it["id"], "session:finished", key="finished:%s:%d" % (it["id"], wg["gen"]), gen=wg["gen"])
         if cur == "in-progress" and alive(wg["pid"]):
             fm = parse_card(open(it["card_path"]).read()) or {}
             tb = timebox_minutes(fm.get("timebox"))
