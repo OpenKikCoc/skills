@@ -1733,6 +1733,26 @@ def send_digest():
         emit("-", "notify:failed", error=str(e)[:200])
 
 
+def last_context_tokens(log_path, tail_bytes=4_000_000):
+    """Context size of the last model call in a Claude stream-json log (input + cache tokens), or None."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for ln in reversed(lines):
+        if '"type":"assistant"' not in ln.replace(" ", ""):
+            continue
+        try:
+            u = json.loads(ln)["message"].get("usage") or {}
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        return sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    return None
+
+
 def wake_coordinator():
     floor = q1("SELECT MAX(CAST(substr(key,6) AS INTEGER)) m FROM wakes WHERE key LIKE 'woke:%'")["m"] or 0
     coord_items = {r["item"] for r in q("SELECT DISTINCT item FROM generations WHERE role='coordinator'")}
@@ -1746,19 +1766,24 @@ def wake_coordinator():
                                          for e in pending)
     # 11-25: one coordinator session had been resumed 159 times (22 MB transcript, ~4M cached tokens per
     # wake). Past coordinator.rotate_after_resumes, start a fresh generation from the HANDOFF/journal.
-    rot = int((S.cfg.get("coordinator") or {}).get("rotate_after_resumes") or 0)
-    if rot and cg["session_id"]:
+    ccfg = S.cfg.get("coordinator") or {}
+    rot = int(ccfg.get("rotate_after_resumes") or 0) or 10 ** 9
+    if (ccfg.get("rotate_after_resumes") or ccfg.get("rotate_at_context_fraction")) and cg["session_id"]:
         n = q1("SELECT COUNT(*) n FROM generations WHERE item=? AND role='coordinator' AND session_id=?",
                cg["item"], cg["session_id"])["n"]
         it = q1("SELECT card_path FROM items WHERE id=?", cg["item"])
-        if n >= rot and it and it["card_path"]:
+        ctx = last_context_tokens(cg["log_path"]) if cg["log_path"] else None
+        frac = float(ccfg.get("rotate_at_context_fraction") or 0)
+        window = int(ccfg.get("context_window") or 1000000)
+        full = bool(frac and ctx and ctx >= frac * window)
+        if (n >= rot or full) and it and it["card_path"]:
             try:
-                plan = launch_core(it["card_path"], "coordinator", False, reason="rotate session after %d resumes" % n)
+                plan = launch_core(it["card_path"], "coordinator", False, reason="rotate session after %d resumes, context %s tokens" % (n, ctx))
             except Fail as e:
                 if once("wakefail:%d" % pending[-1]["id"]):
                     emit(cg["item"], "wake:failed", reason=str(e))
                 return None
-            emit(cg["item"], "coordinator:rotated", from_gen=cg["gen"], gen=plan["gen"], resumes=n)
+            emit(cg["item"], "coordinator:rotated", from_gen=cg["gen"], gen=plan["gen"], resumes=n, context_tokens=ctx)
             once("woke:%d" % pending[-1]["id"])
             return len(pending)
     try:

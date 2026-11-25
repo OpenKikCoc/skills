@@ -1231,6 +1231,32 @@ class TestWatch(Base):
         p = open(os.path.join(self.out, "C-1_coordinator_3.prompt")).read()
         self.assertFalse(p.startswith("[fleet-watch]"))  # a fresh start prompt, not a resume message
 
+    def test_coordinator_session_rotates_at_context_watermark(self):
+        # 11-25: COORD-ND ran at 93-96% of a 1M window before auto-compact; rotate at the watermark instead.
+        self.cfg["coordinator"] = dict(self.cfg.get("coordinator") or {}, rotate_at_context_fraction=0.45,
+                                       context_window=1000)
+        self.write_cfg()
+        self.launch(self.card("C-1", repo="-", base=None), "coordinator")
+        self.wait_dead("C-1", "coordinator")
+        c = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        log = c.execute("SELECT log_path FROM generations WHERE item='C-1' AND role='coordinator'").fetchone()[0]
+        c.close()
+        def usage(n):
+            with open(log, "a") as f:
+                f.write(json.dumps({"type": "assistant", "message": {"usage": {
+                    "input_tokens": 2, "cache_creation_input_tokens": 0, "cache_read_input_tokens": n}}}) + "\n")
+        usage(300)
+        self.run_cli("request", "dispatch", "--message", "go", "--human")
+        self.watch("--wake")
+        self.wait_dead("C-1", "coordinator")
+        self.assertNotIn("coordinator:rotated", self.kinds("C-1"))  # 302 < 450: resume
+        usage(600)
+        self.run_cli("request", "rework", "--human")
+        self.watch("--wake")
+        ev = [e for e in self.j("events") if e["kind"] == "coordinator:rotated"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["detail"]["context_tokens"], 602)
+
     def test_digest_when_supervisor_offline(self):
         sink = os.path.join(self.tmp, "notified.txt")
         self.cfg["notify"] = {"argv": ["sh", "-c", "cat >> " + sink]}
