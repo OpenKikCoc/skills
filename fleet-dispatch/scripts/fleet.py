@@ -1664,6 +1664,11 @@ def watch_items(new):
         st = handoff_state(text) if text else {}
         cur = st.get("state")
         last = q1("SELECT kind FROM events WHERE item=? AND kind LIKE 'state:%' ORDER BY id DESC LIMIT 1", it["id"])
+        # 11-25 ND-30/31: after a rework the HANDOFF State still said awaiting-verify from the rejected
+        # round, so watch re-announced a delivery that was the rejected candidate. Hold it until the
+        # manifest commit differs from the last REWORK candidate.
+        if cur == "awaiting-verify" and stale_rework_delivery(it["id"], text):
+            cur = None
         if cur in WORKER_STATES and (last["kind"] if last else "state:in-progress") != "state:" + cur:
             ev(it["id"], "state:" + cur, state=cur, doing=st.get("doing", ""))
         if it["state"] not in ("in-progress", "blocked", "awaiting-verify"):
@@ -1694,6 +1699,20 @@ def watch_items(new):
                 continue
             if rs and rs != man_sha:
                 ev(it["id"], "drift", True, key="drift:%s:%s" % (it["id"], rs), manifest_sha=man_sha, remote_sha=rs)
+
+
+def stale_rework_delivery(item, text):
+    """True when the HANDOFF claims awaiting-verify for the very commit the last review rejected."""
+    rv = q1("SELECT verdict, candidate_sha FROM reviews WHERE item=? ORDER BY ts DESC, rowid DESC LIMIT 1", item)
+    if not rv or rv["verdict"] != "REWORK" or not rv["candidate_sha"]:
+        return False
+    try:
+        man_sha = next(e.get("sha") for e in read_manifest(text)["evidence"] if e.get("kind") == "commit")
+    except (ValueError, KeyError, StopIteration, TypeError, Fail):
+        return False
+    if not isinstance(man_sha, str) or len(man_sha) < 7:
+        return False
+    return rv["candidate_sha"].startswith(man_sha) or man_sha.startswith(rv["candidate_sha"])
 
 
 def deliver_queued_steers(new):

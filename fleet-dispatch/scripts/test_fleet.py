@@ -1100,6 +1100,31 @@ class TestWatch(Base):
         self.watch()
         self.assertEqual(self.kinds("W-1").count("state:awaiting-verify"), 2)
 
+    def test_awaiting_verify_for_rejected_candidate_is_held(self):
+        # 11-25 ND-30/31: after a REWORK the HANDOFF still claimed awaiting-verify for the rejected
+        # commit; watch must not announce it as a new delivery until the manifest commit changes.
+        c, sha, wenv = self.ready()
+        self.watch()
+        db = sqlite3.connect(os.path.join(self.home, "fleet.db"))
+        db.execute("INSERT INTO reviews(item, verdict, candidate_sha, manifest_sha256, reviewer_gen, ts, notes)"
+                   " VALUES('W-1','REWORK',?, 'x', '2', '2026-11-25T15:00:00Z', 'n')", (sha,))
+        db.commit()
+        db.close()
+        req = os.path.join(self.tmp, "req.md")
+        open(req, "w").write("1. fix the label\n")
+        self.j("rework", "W-1", "--requirements-file", req, "--human")
+        self.wait_dead("W-1", "worker")
+        h = json.loads(re.search(r"```json\n(.*?)```", open(os.path.join(self.wt(), "HANDOFF.md")).read(), re.S).group(1))
+        self.set_handoff("W-1", h)
+        self.watch()
+        self.assertEqual(self.kinds("W-1").count("state:awaiting-verify"), 1)
+        for e in h["evidence"]:
+            if e.get("kind") == "commit":
+                e["sha"] = "f" * 40
+        self.set_handoff("W-1", h)
+        self.watch()
+        self.assertEqual(self.kinds("W-1").count("state:awaiting-verify"), 2)
+
     def test_awaiting_verify_while_alive_wakes_on_exit(self):
         # 11-22 ND-11: worker wrote awaiting-verify mid-edit, coordinator deferred, exit woke nobody.
         c, sha, wenv = self.ready()
