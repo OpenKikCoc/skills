@@ -1215,6 +1215,22 @@ class TestWatch(Base):
         self.wait_dead("C-1", "coordinator")
         self.assertIsNone(self.watch("--wake")["woke"])  # nothing new
 
+    def test_coordinator_session_rotates_after_n_resumes(self):
+        # 11-25: COORD-ND resumed one session 159 times (22 MB transcript); rotate to a fresh generation.
+        self.cfg["coordinator"] = dict(self.cfg.get("coordinator") or {}, rotate_after_resumes=2)
+        self.write_cfg()
+        self.launch(self.card("C-1", repo="-", base=None), "coordinator")
+        self.wait_dead("C-1", "coordinator")
+        self.run_cli("request", "dispatch", "--message", "go", "--human")
+        self.assertEqual(self.watch("--wake")["woke"], 1)  # gen 2 resumes gen 1's session
+        self.wait_dead("C-1", "coordinator")
+        self.assertNotIn("coordinator:rotated", self.kinds("C-1"))
+        self.run_cli("request", "rework", "--human")
+        self.assertEqual(self.watch("--wake")["woke"], 1)  # 2 gens on one session -> fresh gen 3
+        self.assertIn("coordinator:rotated", self.kinds("C-1"))
+        p = open(os.path.join(self.out, "C-1_coordinator_3.prompt")).read()
+        self.assertFalse(p.startswith("[fleet-watch]"))  # a fresh start prompt, not a resume message
+
     def test_digest_when_supervisor_offline(self):
         sink = os.path.join(self.tmp, "notified.txt")
         self.cfg["notify"] = {"argv": ["sh", "-c", "cat >> " + sink]}

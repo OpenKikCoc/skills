@@ -1744,6 +1744,23 @@ def wake_coordinator():
         return None
     msg = "[fleet-watch]\n" + "\n".join("%d %s %s%s" % (e["id"], e["item"], e["kind"], " URGENT" if e["urgent"] else "")
                                          for e in pending)
+    # 11-25: one coordinator session had been resumed 159 times (22 MB transcript, ~4M cached tokens per
+    # wake). Past coordinator.rotate_after_resumes, start a fresh generation from the HANDOFF/journal.
+    rot = int((S.cfg.get("coordinator") or {}).get("rotate_after_resumes") or 0)
+    if rot and cg["session_id"]:
+        n = q1("SELECT COUNT(*) n FROM generations WHERE item=? AND role='coordinator' AND session_id=?",
+               cg["item"], cg["session_id"])["n"]
+        it = q1("SELECT card_path FROM items WHERE id=?", cg["item"])
+        if n >= rot and it and it["card_path"]:
+            try:
+                plan = launch_core(it["card_path"], "coordinator", False, reason="rotate session after %d resumes" % n)
+            except Fail as e:
+                if once("wakefail:%d" % pending[-1]["id"]):
+                    emit(cg["item"], "wake:failed", reason=str(e))
+                return None
+            emit(cg["item"], "coordinator:rotated", from_gen=cg["gen"], gen=plan["gen"], resumes=n)
+            once("woke:%d" % pending[-1]["id"])
+            return len(pending)
     try:
         resume_gen(cg, msg, use_steers=False)
     except Fail as e:
